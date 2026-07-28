@@ -1,0 +1,23 @@
+name: Swift
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Resolve dependencies
+        run: swift package resolve
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
