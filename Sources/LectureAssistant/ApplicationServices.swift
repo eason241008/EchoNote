@@ -39,7 +39,6 @@ public struct ApplicationServices: Sendable {
     public let studyNotes: any StudyNotesService
     public let library: any LectureLibraryService
     public let export: any LectureExportService
-    public let credentials: any ProviderCredentialStore
 
     public init(
         scheduling: any CourseSchedulingService,
@@ -48,8 +47,7 @@ public struct ApplicationServices: Sendable {
         translation: any TranslationService,
         studyNotes: any StudyNotesService,
         library: any LectureLibraryService,
-        export: any LectureExportService,
-        credentials: any ProviderCredentialStore
+        export: any LectureExportService
     ) {
         self.scheduling = scheduling
         self.capture = capture
@@ -58,7 +56,6 @@ public struct ApplicationServices: Sendable {
         self.studyNotes = studyNotes
         self.library = library
         self.export = export
-        self.credentials = credentials
     }
 }
 
@@ -94,7 +91,6 @@ public extension ApplicationServices {
         translation: EmptyTranslationService(),
         studyNotes: EmptyStudyNotesService(),
         library: EmptyLectureLibraryService(),
-        export: EmptyLectureExportService(),
-        credentials: KeychainProviderCredentialStore()
+        export: EmptyLectureExportService()
     )
 }

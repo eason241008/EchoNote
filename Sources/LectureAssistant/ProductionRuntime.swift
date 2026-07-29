@@ -8,6 +8,7 @@ public final class ProductionRuntime: ObservableObject {
     public let library: LectureLibraryModel
     public let settings: RuntimeSettingsModel
     public let speechModel: SpeechModelManager
+    public let translationProvider: AppleTranslationProvider
     public let modelsRootURL: URL
     public let applicationSupportURL: URL
     public init(fileManager: FileManager = .default, defaults: UserDefaults = .standard) throws {
@@ -32,7 +33,9 @@ public final class ProductionRuntime: ObservableObject {
         let modelsURL = baseURL.appendingPathComponent("Models", isDirectory: true)
         modelsRootURL = modelsURL
         let speechModelManager = SpeechModelManager(modelsRootURL: modelsURL)
+        let translationProvider = AppleTranslationProvider()
         speechModel = speechModelManager
+        self.translationProvider = translationProvider
 
         let captionWorkspace = CaptionWorkspaceModel(defaults: defaults)
         let timetable = TimetableStore(defaults: defaults)
@@ -56,7 +59,7 @@ public final class ProductionRuntime: ObservableObject {
             database: database,
             modelFolder: modelFolder,
             captionWorkspace: captionWorkspace,
-            defaults: defaults
+            translationProvider: translationProvider
         )
         let services = ApplicationServices(
             scheduling: EmptyCourseSchedulingService(),
@@ -65,8 +68,7 @@ public final class ProductionRuntime: ObservableObject {
             translation: EmptyTranslationService(),
             studyNotes: EmptyStudyNotesService(),
             library: EmptyLectureLibraryService(),
-            export: EmptyLectureExportService(),
-            credentials: KeychainProviderCredentialStore()
+            export: EmptyLectureExportService()
         )
         applicationModel = ApplicationModel(
             services: services,

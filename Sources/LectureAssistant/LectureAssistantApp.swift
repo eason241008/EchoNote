@@ -1,6 +1,6 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
+import Translation
 
 @MainActor
 private final class LectureAssistantAppDelegate: NSObject, NSApplicationDelegate {
@@ -54,7 +54,8 @@ struct EchoNoteApp: App {
                 timetable: runtime.timetable,
                 library: runtime.library,
                 runtimeSettings: runtime.settings,
-                speechModel: runtime.speechModel
+                speechModel: runtime.speechModel,
+                translationProvider: runtime.translationProvider
             )
         }
         .defaultSize(width: 1120, height: 760)
@@ -122,11 +123,16 @@ struct ContentView: View {
     @ObservedObject var library: LectureLibraryModel
     @ObservedObject var runtimeSettings: RuntimeSettingsModel
     @ObservedObject var speechModel: SpeechModelManager
+    let translationProvider: AppleTranslationProvider
     @AppStorage("lecture-assistant.selected-section")
     private var selectionRawValue = AppSection.recording.rawValue
     @State private var title = "今天的课程"
     @State private var errorMessage: String?
-    @StateObject private var providerSettings = ProviderSettingsModel()
+    @State private var translationServiceState = AppleTranslationServiceState.preparing
+    @State private var translationConfiguration = TranslationSession.Configuration(
+        source: Locale.Language(identifier: "en"),
+        target: Locale.Language(identifier: "zh-Hans")
+    )
     @State private var overlayController: CaptionOverlayWindowController?
 
     private var selection: AppSection {
@@ -161,6 +167,18 @@ struct ContentView: View {
             )
             await model.refreshCapturePreflight()
             await timetable.refresh()
+        }
+        .task {
+            for await state in translationProvider.states {
+                translationServiceState = state
+                captionWorkspace.setTranslationAvailable(state == .ready)
+                captionWorkspace.updateTranslationState(state.displayText)
+            }
+        }
+        .translationTask(translationConfiguration) { session in
+            await translationProvider.run(
+                session: AppleTranslationSessionAdapter(session: session)
+            )
         }
         .onChange(of: speechModel.state) {
             captionWorkspace.updateTranscriptionState(
@@ -280,7 +298,7 @@ struct ContentView: View {
             LibraryPage(model: library)
         case .settings:
             SettingsPage(
-                model: providerSettings,
+                translationState: translationServiceState,
                 runtime: runtimeSettings,
                 speechModel: speechModel
             )
@@ -855,13 +873,10 @@ private struct LibraryPage: View {
 }
 
 private struct SettingsPage: View {
-    @ObservedObject var model: ProviderSettingsModel
+    let translationState: AppleTranslationServiceState
     @ObservedObject var runtime: RuntimeSettingsModel
     @ObservedObject var speechModel: SpeechModelManager
-    @State private var providerModel = ""
-    @State private var providerID = "openai"
     @State private var timetableURL = ""
-    @State private var isSelectingConfiguration = false
     @State private var modelErrorMessage: String?
 
     var body: some View {
@@ -945,36 +960,20 @@ private struct SettingsPage: View {
             }
 
             SoftCard {
-                VStack(alignment: .leading, spacing: 16) {
-                    Label("中文翻译服务", systemImage: "character.book.closed.fill")
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Apple 本地中文翻译", systemImage: "character.book.closed.fill")
                         .font(.headline)
-                    if let configuration = model.configuration {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("\(configuration.providerID) · \(configuration.model)")
-                                    .font(.system(size: 15, weight: .medium))
-                                Text(configuration.baseURL.absoluteString)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("移除配置", role: .destructive) { model.removeConfiguration() }
-                                .buttonStyle(SecondaryActionButtonStyle())
-                        }
-                    } else {
-                        Text("未配置时仍可离线完成英文转写。API 密钥只保存在 macOS 钥匙串。")
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 12) {
-                            TextField("服务商标识", text: $providerID)
-                            TextField("翻译模型", text: $providerModel)
-                            Button("导入 OMP 配置") { isSelectingConfiguration = true }
-                                .buttonStyle(PrimaryActionButtonStyle())
-                                .disabled(providerID.isEmpty || providerModel.isEmpty)
-                        }
-                        .textFieldStyle(.roundedBorder)
-                    }
-                    if let statusMessage = model.statusMessage {
-                        InlineNotice(icon: "info.circle.fill", text: statusMessage, tint: AppPalette.sage)
+                    Text(translationState.displayText)
+                        .font(.system(size: 15, weight: .medium))
+                    Text("英文到简体中文的翻译由 macOS Translation framework 在本机完成，不使用 DeepSeek、OMP 配置或 API 密钥。首次使用时，系统可能要求下载语言包。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if case .unavailable = translationState {
+                        InlineNotice(
+                            icon: "exclamationmark.triangle.fill",
+                            text: "请确认已联网并允许 macOS 下载英语和简体中文语言包，然后重新启动 EchoNote。",
+                            tint: AppPalette.coral
+                        )
                     }
                 }
             }
@@ -1038,16 +1037,6 @@ private struct SettingsPage: View {
                     }
                 }
             }
-        }
-        .fileImporter(
-            isPresented: $isSelectingConfiguration,
-            allowedContentTypes: [.data],
-            allowsMultipleSelection: false
-        ) { result in
-            guard case let .success(urls) = result, let url = urls.first else { return }
-            let accessed = url.startAccessingSecurityScopedResource()
-            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-            model.importOMPConfiguration(from: url, providerID: providerID, model: providerModel)
         }
         .onAppear {
             timetableURL = runtime.timetableURL?.absoluteString ?? ""

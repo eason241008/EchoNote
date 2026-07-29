@@ -74,14 +74,16 @@ Fast English lectures are difficult to follow when listening, translating, and t
 
 | Requirement | Minimum |
 | --- | --- |
-| macOS | 14.0 Sonoma |
+| macOS | 15.0 Sequoia |
 | Hardware | Apple Silicon recommended |
 | Xcode | 16.0 or newer |
 | Swift | 5.9 toolchain or newer |
 | Disk | About 500 MB for the default `Whisper small.en` model, plus recordings |
-| Network | Initial dependency/model download; translation and ICS sync when enabled |
+| Network | Initial dependency/model download, Apple language download, and ICS sync |
 
-EchoNote uses [Argmax Open-Source SDK / WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) `1.0.0`. That release officially requires macOS 14 and Xcode 16.
+EchoNote uses Apple's on-device Translation framework for English-to-Simplified-Chinese captions. Translation content stays on the Mac; the system may ask before downloading the required language models.
+
+EchoNote uses [Argmax Open-Source SDK / WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) `1.0.0` for local English transcription.
 
 ## Quick Start
 

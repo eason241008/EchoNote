@@ -6,9 +6,7 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
     private let database: LectureDatabase
     private let modelFolder: URL
     private let captionWorkspace: CaptionWorkspaceModel
-    private let credentialStore: any ProviderCredentialStore
-    private let defaults: UserDefaults
-    private let translationProviderOverride: (any SimplifiedChineseTranslationProviding)?
+    private let translationProvider: any SimplifiedChineseTranslationProviding
 
     private var capture: AVFoundationLectureCaptureService?
     private var transcription: LiveTranscriptionPipeline?
@@ -24,17 +22,13 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         database: LectureDatabase,
         modelFolder: URL,
         captionWorkspace: CaptionWorkspaceModel,
-        credentialStore: any ProviderCredentialStore = KeychainProviderCredentialStore(),
-        defaults: UserDefaults = .standard,
-        translationProviderOverride: (any SimplifiedChineseTranslationProviding)? = nil
+        translationProvider: any SimplifiedChineseTranslationProviding
     ) {
         self.storage = storage
         self.database = database
         self.modelFolder = modelFolder
         self.captionWorkspace = captionWorkspace
-        self.credentialStore = credentialStore
-        self.translationProviderOverride = translationProviderOverride
-        self.defaults = defaults
+        self.translationProvider = translationProvider
     }
 
     public func prepare(_ preparation: LectureCapturePreparation) async throws {
@@ -67,9 +61,9 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         self.capture = capture
         self.transcription = transcription
         self.translation = translation
-        captionWorkspace.setTranslationAvailable(translation != nil)
+        captionWorkspace.setTranslationAvailable(true)
         captionWorkspace.updateTranscriptionState("本地模型已就绪")
-        captionWorkspace.updateTranslationState(translation == nil ? "仅英文" : "翻译已就绪")
+        captionWorkspace.updateTranslationState("Apple 本地翻译")
 
         frameTask = Task { [capture, transcription] in
             for await frame in capture.frames {
@@ -95,22 +89,20 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
                 }
             }
         }
-        if let translation {
-            translationStateTask = Task { [weak self, translation] in
-                for await state in translation.states {
-                    guard !Task.isCancelled else { break }
-                    await MainActor.run { self?.updateTranslationState(state) }
-                }
+        translationStateTask = Task { [weak self, translation] in
+            for await state in translation.states {
+                guard !Task.isCancelled else { break }
+                await MainActor.run { self?.updateTranslationState(state) }
             }
-            translationResultTask = Task { [weak self, translation] in
-                for await result in translation.results {
-                    guard !Task.isCancelled else { break }
-                    await MainActor.run {
-                        self?.captionWorkspace.setTranslation(
-                            result.text,
-                            for: result.revisionID
-                        )
-                    }
+        }
+        translationResultTask = Task { [weak self, translation] in
+            for await result in translation.results {
+                guard !Task.isCancelled else { break }
+                await MainActor.run {
+                    self?.captionWorkspace.setTranslation(
+                        result.text,
+                        for: result.revisionID
+                    )
                 }
             }
         }
@@ -164,26 +156,9 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         }
     }
 
-    private func makeTranslationPipeline() -> TranslationPipeline? {
-        if let translationProviderOverride {
-            return TranslationPipeline(
-                provider: translationProviderOverride,
-                repository: SQLiteTranslationRepository(database: database)
-            )
-        }
-        let importer = ProviderConfigurationImporter(
-            credentialStore: credentialStore,
-            defaults: defaults
-        )
-        guard let configuration = importer.configuredProvider(),
-              let apiKey = try? credentialStore.credential(for: configuration.providerID)
-        else { return nil }
-        let provider = OpenAICompatibleTranslationProvider(
-            configuration: configuration,
-            apiKey: apiKey
-        )
-        return TranslationPipeline(
-            provider: provider,
+    private func makeTranslationPipeline() -> TranslationPipeline {
+        TranslationPipeline(
+            provider: translationProvider,
             repository: SQLiteTranslationRepository(database: database)
         )
     }

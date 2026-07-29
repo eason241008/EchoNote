@@ -122,8 +122,7 @@ final class RecordingStartGateTests: XCTestCase {
                 translation: EmptyTranslationService(),
                 studyNotes: EmptyStudyNotesService(),
                 library: EmptyLectureLibraryService(),
-                export: EmptyLectureExportService(),
-                credentials: KeychainProviderCredentialStore(service: "test-\(defaultsName)")
+                export: EmptyLectureExportService()
             ),
             defaults: defaults,
             preflightService: CapturePreflightService(
@@ -175,8 +174,7 @@ final class RecordingStartGateTests: XCTestCase {
             translation: EmptyTranslationService(),
             studyNotes: EmptyStudyNotesService(),
             library: EmptyLectureLibraryService(),
-            export: EmptyLectureExportService(),
-            credentials: KeychainProviderCredentialStore(service: "test-\(defaultsName)")
+            export: EmptyLectureExportService()
         )
         return (ApplicationModel(services: services, defaults: defaults), capture)
     }
