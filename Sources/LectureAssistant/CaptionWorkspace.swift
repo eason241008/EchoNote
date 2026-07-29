@@ -9,7 +9,7 @@ public enum CaptionLanguageVisibility: String, CaseIterable, Codable, Sendable {
 
 public struct CaptionDisplaySettings: Codable, Equatable, Sendable {
     public var languageVisibility: CaptionLanguageVisibility = .bilingual
-    public var textSize: Double = 24
+    public var textSize: Double = 32
     public var opacity: Double = 0.92
     public var positionX: Double = 80
     public var positionY: Double = 80
@@ -19,7 +19,7 @@ public struct CaptionDisplaySettings: Codable, Equatable, Sendable {
 @MainActor
 public final class CaptionWorkspaceModel: ObservableObject {
     @Published public private(set) var captureState = "尚未录音"
-    @Published public private(set) var transcriptionState = "本地模型已就绪"
+    @Published public private(set) var transcriptionState = "正在检查本地模型"
     @Published public private(set) var translationState = "按需启用"
     @Published public private(set) var segments: [LiveTranscriptSegment] = []
     @Published public private(set) var translations: [TranscriptRevisionID: String] = [:]
@@ -28,12 +28,21 @@ public final class CaptionWorkspaceModel: ObservableObject {
     }
     private let defaults: UserDefaults
     private let settingsKey = "lecture-assistant.caption-display"
+    private let settingsMigrationKey = "lecture-assistant.caption-display-v2"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        settings = defaults.data(forKey: settingsKey)
+        var restored = defaults.data(forKey: settingsKey)
             .flatMap { try? JSONDecoder().decode(CaptionDisplaySettings.self, from: $0) }
             ?? CaptionDisplaySettings()
+        if !defaults.bool(forKey: settingsMigrationKey), restored.textSize == 24 {
+            restored.textSize = 32
+            defaults.set(true, forKey: settingsMigrationKey)
+            if let data = try? JSONEncoder().encode(restored) {
+                defaults.set(data, forKey: settingsKey)
+            }
+        }
+        settings = restored
     }
 
     public func updateCaptureState(_ state: String) { captureState = state }
@@ -108,14 +117,15 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
     public var accessibilityLabel: String? {
         window?.contentView?.accessibilityLabel()
     }
+    public var windowSize: NSSize? { window?.contentView?.bounds.size }
 
     public func show() {
         if window == nil {
             let proposed = NSRect(
                 x: model.settings.positionX,
                 y: model.settings.positionY,
-                width: 720,
-                height: 150
+                width: 960,
+                height: 260
             )
             let visible = NSScreen.main?.visibleFrame ?? proposed
             let contentRect = NSRect(
@@ -142,7 +152,13 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
                 alpha: 0.96
             )
             panel.isOpaque = false
-            panel.contentView = NSHostingView(rootView: CaptionOverlayView(model: model))
+            let hostingView = NSHostingView(rootView: CaptionOverlayView(model: model))
+            hostingView.sizingOptions = []
+            panel.contentView = hostingView
+            panel.setContentSize(NSSize(width: 960, height: 260))
+            panel.minSize = panel.frameRect(
+                forContentRect: NSRect(x: 0, y: 0, width: 760, height: 220)
+            ).size
             panel.delegate = self
             window = panel
         }
@@ -153,6 +169,18 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
     public func hide() {
         model.quickHide()
         window?.orderOut(nil)
+    }
+    public func windowWillResize(
+        _ sender: NSWindow,
+        to frameSize: NSSize
+    ) -> NSSize {
+        let minimumFrame = sender.frameRect(
+            forContentRect: NSRect(x: 0, y: 0, width: 760, height: 220)
+        ).size
+        return NSSize(
+            width: max(frameSize.width, minimumFrame.width),
+            height: max(frameSize.height, minimumFrame.height)
+        )
     }
 
     public func toggle() {
@@ -169,15 +197,18 @@ private struct CaptionOverlayView: View {
     @ObservedObject var model: CaptionWorkspaceModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(model.segments.suffix(3), id: \.id) { segment in
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(model.segments.suffix(2), id: \.id) { segment in
                 CaptionSegmentText(model: model, segment: segment)
             }
             if model.segments.isEmpty {
-                Text("等待字幕…").foregroundStyle(.secondary)
+                Text("等待字幕…")
+                    .font(.system(size: model.settings.textSize))
+                    .foregroundStyle(.secondary)
             }
         }
-        .padding(16)
+        .padding(.horizontal, 26)
+        .padding(.vertical, 22)
         .opacity(model.settings.opacity)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("课堂实时双语字幕")
@@ -194,9 +225,10 @@ struct CaptionSegmentText: View {
             Text("[缺失片段]")
                 .foregroundStyle(Color(red: 0.93, green: 0.70, blue: 0.45))
         } else {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 10) {
                 if model.settings.languageVisibility != .simplifiedChineseOnly {
                     Text(segment.text)
+                        .fontWeight(.semibold)
                 }
                 if model.settings.languageVisibility != .englishOnly {
                     Text(model.translation(for: segment) ?? "等待翻译…")
@@ -205,7 +237,8 @@ struct CaptionSegmentText: View {
             }
             .font(.system(size: model.settings.textSize))
             .foregroundStyle(.white)
-            .lineLimit(2)
+            .lineLimit(3)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

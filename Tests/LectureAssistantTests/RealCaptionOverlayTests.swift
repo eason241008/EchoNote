@@ -23,6 +23,7 @@ final class RealCaptionOverlayTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         XCTAssertTrue(controller.isVisible)
         XCTAssertEqual(controller.windowLevel, .floating)
+        XCTAssertEqual(controller.windowSize, NSSize(width: 960, height: 260))
 
         controller.hide()
         XCTAssertFalse(controller.isVisible)

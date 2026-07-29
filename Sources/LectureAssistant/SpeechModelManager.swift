@@ -116,6 +116,22 @@ public final class SpeechModelManager: ObservableObject {
         if case .ready = state { return true }
         return false
     }
+    public var isBusy: Bool {
+        switch state {
+        case .downloading, .verifying: return true
+        case .notInstalled, .ready, .failed: return false
+        }
+    }
+
+    public var statusText: String {
+        switch state {
+        case .notInstalled: return "未安装"
+        case let .downloading(progress): return "下载中 · \(Int(progress * 100))%"
+        case .verifying: return "正在验证"
+        case .ready: return "已就绪"
+        case .failed: return "验证失败"
+        }
+    }
 
     public func refresh() async {
         let candidates = installedCandidates()

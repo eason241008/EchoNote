@@ -16,7 +16,7 @@ public final class ApplicationModel: ObservableObject {
     private let indicatorStore: RecordingIndicatorStore
     private let preflightService: CapturePreflightService?
     private let storageRootURL: URL?
-    private let transcriptionModelReady: @Sendable () -> Bool
+    private let transcriptionModelReady: @MainActor @Sendable () -> Bool
 
     public init(
         services: ApplicationServices = .unavailable,
@@ -26,7 +26,7 @@ public final class ApplicationModel: ObservableObject {
         indicatorStore: RecordingIndicatorStore? = nil,
         preflightService: CapturePreflightService? = nil,
         storageRootURL: URL? = nil,
-        transcriptionModelReady: @escaping @Sendable () -> Bool = { false }
+        transcriptionModelReady: @escaping @MainActor @Sendable () -> Bool = { false }
     ) {
         self.services = services
         self.defaults = defaults
@@ -88,6 +88,9 @@ public final class ApplicationModel: ObservableObject {
 
     public func startRecording() async throws {
         guard var session = activeSession, session.state == .prepared else { return }
+        if preflightService != nil {
+            await refreshCapturePreflight()
+        }
         guard let capturePreflight else {
             throw RecordingStartGateError.preflightNotReady([])
         }

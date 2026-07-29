@@ -7,6 +7,7 @@ public final class ProductionRuntime: ObservableObject {
     public let timetable: TimetableStore
     public let library: LectureLibraryModel
     public let settings: RuntimeSettingsModel
+    public let speechModel: SpeechModelManager
     public let modelsRootURL: URL
     public let applicationSupportURL: URL
     public init(fileManager: FileManager = .default, defaults: UserDefaults = .standard) throws {
@@ -30,6 +31,8 @@ public final class ProductionRuntime: ObservableObject {
         let sessionsURL = baseURL.appendingPathComponent("Sessions", isDirectory: true)
         let modelsURL = baseURL.appendingPathComponent("Models", isDirectory: true)
         modelsRootURL = modelsURL
+        let speechModelManager = SpeechModelManager(modelsRootURL: modelsURL)
+        speechModel = speechModelManager
 
         let captionWorkspace = CaptionWorkspaceModel(defaults: defaults)
         let timetable = TimetableStore(defaults: defaults)
@@ -71,7 +74,7 @@ public final class ProductionRuntime: ObservableObject {
             preflightService: CapturePreflightService(),
             storageRootURL: sessionsURL,
             transcriptionModelReady: {
-                FileManager.default.fileExists(atPath: modelFolder.path)
+                speechModelManager.isReady
             }
         )
     }

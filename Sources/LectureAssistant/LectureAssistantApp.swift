@@ -53,7 +53,8 @@ struct EchoNoteApp: App {
                 captionWorkspace: runtime.captionWorkspace,
                 timetable: runtime.timetable,
                 library: runtime.library,
-                runtimeSettings: runtime.settings
+                runtimeSettings: runtime.settings,
+                speechModel: runtime.speechModel
             )
         }
         .defaultSize(width: 1120, height: 760)
@@ -120,6 +121,7 @@ struct ContentView: View {
     @ObservedObject var timetable: TimetableStore
     @ObservedObject var library: LectureLibraryModel
     @ObservedObject var runtimeSettings: RuntimeSettingsModel
+    @ObservedObject var speechModel: SpeechModelManager
     @AppStorage("lecture-assistant.selected-section")
     private var selectionRawValue = AppSection.recording.rawValue
     @State private var title = "今天的课程"
@@ -153,8 +155,18 @@ struct ContentView: View {
         .frame(minWidth: 940, minHeight: 640)
         .preferredColorScheme(.dark)
         .task {
+            await speechModel.refresh()
+            captionWorkspace.updateTranscriptionState(
+                speechModel.isReady ? "本地模型已就绪" : "本地模型未安装"
+            )
             await model.refreshCapturePreflight()
             await timetable.refresh()
+        }
+        .onChange(of: speechModel.state) {
+            captionWorkspace.updateTranscriptionState(
+                speechModel.isReady ? "本地模型已就绪" : "本地模型未安装"
+            )
+            Task { await model.refreshCapturePreflight() }
         }
     }
 
@@ -267,7 +279,11 @@ struct ContentView: View {
         case .library:
             LibraryPage(model: library)
         case .settings:
-            SettingsPage(model: providerSettings, runtime: runtimeSettings)
+            SettingsPage(
+                model: providerSettings,
+                runtime: runtimeSettings,
+                speechModel: speechModel
+            )
         }
     }
 
@@ -302,7 +318,9 @@ private struct RecordingPage: View {
                 StatusCard(
                     icon: "waveform",
                     title: "本地转写",
-                    value: captionWorkspace.transcriptionState,
+                    value: model.capturePreflight?.issues.contains(.transcriptionModelUnavailable) == true
+                        ? "本地模型未就绪"
+                        : captionWorkspace.transcriptionState,
                     tint: Color(red: 0.34, green: 0.48, blue: 0.58)
                 )
                 StatusCard(
@@ -610,7 +628,7 @@ private struct CaptionPage: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("文字大小  \(Int(model.settings.textSize))")
                                 .font(.caption)
-                            Slider(value: $model.settings.textSize, in: 14...48)
+                            Slider(value: $model.settings.textSize, in: 18...64)
                         }
                         VStack(alignment: .leading, spacing: 8) {
                             Text("背景透明度  \(Int(model.settings.opacity * 100))%")
@@ -839,10 +857,12 @@ private struct LibraryPage: View {
 private struct SettingsPage: View {
     @ObservedObject var model: ProviderSettingsModel
     @ObservedObject var runtime: RuntimeSettingsModel
-    @State private var providerID = "openai"
+    @ObservedObject var speechModel: SpeechModelManager
     @State private var providerModel = ""
+    @State private var providerID = "openai"
     @State private var timetableURL = ""
     @State private var isSelectingConfiguration = false
+    @State private var modelErrorMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -850,8 +870,8 @@ private struct SettingsPage: View {
                 StatusCard(
                     icon: "waveform",
                     title: "离线转写模型",
-                    value: runtime.modelInstalled ? "已安装 · \(runtime.modelSize.formattedBytes)" : "未安装",
-                    tint: runtime.modelInstalled ? AppPalette.sage : AppPalette.coral
+                    value: speechModel.statusText,
+                    tint: speechModel.isReady ? AppPalette.sage : AppPalette.coral
                 )
                 StatusCard(
                     icon: "externaldrive.fill",
@@ -865,6 +885,63 @@ private struct SettingsPage: View {
                     value: runtime.timetableURL?.host ?? "未配置",
                     tint: Color(red: 0.55, green: 0.43, blue: 0.62)
                 )
+            }
+
+            SoftCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label("本地英文转写模型", systemImage: "waveform")
+                        .font(.headline)
+                    Text("Whisper small.en · 约 500 MB。下载并验证成功后才能开始录音。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if case let .downloading(progress) = speechModel.state {
+                        ProgressView(value: progress)
+                        Text("正在下载 \(Int(progress * 100))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else if case .verifying = speechModel.state {
+                        ProgressView("正在验证本地模型…")
+                    }
+                    HStack(spacing: 12) {
+                        if speechModel.isReady {
+                            Button("重新验证") {
+                                Task { await speechModel.refresh() }
+                            }
+                            .buttonStyle(SecondaryActionButtonStyle())
+                            Button("删除模型", role: .destructive) {
+                                Task {
+                                    do {
+                                        try await speechModel.remove()
+                                        modelErrorMessage = nil
+                                    } catch {
+                                        modelErrorMessage = error.localizedDescription
+                                    }
+                                }
+                            }
+                            .buttonStyle(SecondaryActionButtonStyle())
+                        } else {
+                            Button("下载并验证模型") {
+                                Task {
+                                    do {
+                                        try await speechModel.downloadAfterUserConfirmation()
+                                        modelErrorMessage = nil
+                                    } catch {
+                                        modelErrorMessage = error.localizedDescription
+                                    }
+                                }
+                            }
+                            .buttonStyle(PrimaryActionButtonStyle())
+                            .disabled(speechModel.isBusy)
+                        }
+                    }
+                    if let modelErrorMessage {
+                        InlineNotice(
+                            icon: "exclamationmark.triangle.fill",
+                            text: modelErrorMessage,
+                            tint: AppPalette.coral
+                        )
+                    }
+                }
             }
 
             SoftCard {
