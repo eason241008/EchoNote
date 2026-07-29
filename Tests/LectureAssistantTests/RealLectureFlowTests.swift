@@ -40,8 +40,12 @@ final class RealLectureFlowTests: XCTestCase {
         try database.migrate()
         let storage = SessionStorage(rootURL: root.appendingPathComponent("Sessions"))
         let captions = CaptionWorkspaceModel()
-        let modelFolder = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/课堂伴侣/Models/openai_whisper-small.en")
+        let modelsRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/EchoNote/Models")
+        let modelFolder = modelsRoot.appendingPathComponent(
+            SpeechModelDescriptor.nemotronStreaming1120.relativePath,
+            isDirectory: true
+        )
         let service = ProductionLectureCaptureService(
             storage: storage,
             database: database,

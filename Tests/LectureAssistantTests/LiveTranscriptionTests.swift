@@ -3,137 +3,139 @@ import Foundation
 import XCTest
 @testable import LectureAssistant
 
-private actor StubSpeechRecognizer: LocalSpeechRecognizing {
-    enum Behavior {
-        case output(String)
-        case outputs([SpeechRecognitionOutput])
-        case empty
-        case failure
-    }
-    var behavior: Behavior
-    private(set) var prompts: [String?] = []
+private actor StubStreamingSpeechRecognizer: StreamingSpeechRecognizing {
+    enum Failure: Error { case recognition }
 
-    init(behavior: Behavior) { self.behavior = behavior }
+    private var partials: [String]
+    private var finalText: String
+    private var shouldFail: Bool
+    private(set) var consumedBufferCount = 0
+    private(set) var finalizeCount = 0
+    private(set) var resetCount = 0
 
-    func transcribe(samples: [Float], prompt: String?) async throws -> [SpeechRecognitionOutput] {
-        prompts.append(prompt)
-        switch behavior {
-        case let .output(text):
-            return [SpeechRecognitionOutput(
-                text: text,
-                start: 0,
-                end: Double(samples.count) / 16_000
-            )]
-        case let .outputs(outputs):
-            return outputs
-        case .empty:
-            return []
-        case .failure:
-            throw NSError(domain: "StubSpeechRecognizer", code: 1)
-        }
+    init(partials: [String], finalText: String, shouldFail: Bool = false) {
+        self.partials = partials
+        self.finalText = finalText
+        self.shouldFail = shouldFail
     }
 
-    func latestPrompt() -> String? { prompts.last ?? nil }
+    func consume(_ buffer: AVAudioPCMBuffer) async throws -> String {
+        consumedBufferCount += 1
+        if shouldFail { throw Failure.recognition }
+        return partials.isEmpty ? finalText : partials.removeFirst()
+    }
 
-    func setBehavior(_ behavior: Behavior) { self.behavior = behavior }
+    func finalize() async throws -> String {
+        finalizeCount += 1
+        if shouldFail { throw Failure.recognition }
+        return finalText
+    }
+
+    func reset() async { resetCount += 1 }
+
+    func counts() -> (consumed: Int, finalized: Int, reset: Int) {
+        (consumedBufferCount, finalizeCount, resetCount)
+    }
 }
 
 final class LiveTranscriptionTests: XCTestCase {
-    func testPublishesPartialThenFinalAndPersistsFinalRevision() async throws {
-        let fixture = try await makeFixture()
-        await fixture.pipeline.updatePrompt("neural network")
-        let collector = Task { () -> [LiveTranscriptSegment] in
-            var values: [LiveTranscriptSegment] = []
-            for await segment in fixture.pipeline.segments { values.append(segment) }
-            return values
-        }
-        let latencyCollector = Task { () -> [CaptionLatencyStatus] in
-            var values: [CaptionLatencyStatus] = []
-            for await status in fixture.pipeline.latencyStatuses { values.append(status) }
-            return values
-        }
+    func testPublishesPartialThenFinalAndPersistsOnlyFinalRevision() async throws {
+        let fixture = try await makeFixture(
+            partials: ["recognized", "recognized lecture"],
+            finalText: "recognized lecture"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
 
-        await fixture.pipeline.consume(try frame(samples: 16_000))
-        await fixture.pipeline.consume(try frame(samples: 16_000))
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -12))
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -12))
+        await fixture.pipeline.pause()
         await fixture.pipeline.finish()
         let segments = await collector.value
-        let latencyStatuses = await latencyCollector.value
 
-        XCTAssertTrue(segments.contains { !$0.isFinal && !$0.isGap })
+        XCTAssertTrue(segments.contains { !$0.isFinal && $0.text == "recognized" })
         let finalized = try XCTUnwrap(segments.last { $0.isFinal && !$0.isGap })
+        XCTAssertEqual(finalized.text, "recognized lecture")
         let stored = try await MainActor.run {
             try fixture.repository.history(sessionID: fixture.session.id, segmentID: finalized.id)
         }
-        XCTAssertEqual(stored.count, 1)
-        XCTAssertEqual(stored[0].text, "recognized lecture")
-        let latestPrompt = await fixture.recognizer.latestPrompt()
-        XCTAssertEqual(latestPrompt, "neural network")
-        XCTAssertFalse(latencyStatuses.isEmpty)
-        XCTAssertGreaterThanOrEqual(latencyStatuses.last!.latestSeconds, 0)
+        XCTAssertEqual(stored.map(\.text), ["recognized lecture"])
+        let counts = await fixture.recognizer.counts()
+        XCTAssertEqual(counts.finalized, 1)
     }
 
-    func testPromptAcceptsEnglishTerminologyAndRejectsChineseCourseTitle() async throws {
-        let fixture = try await makeFixture()
-        await fixture.pipeline.updatePrompt("今天的课程")
-        await fixture.pipeline.consume(try frame(samples: 16_000))
-        let rejectedPrompt = await fixture.recognizer.latestPrompt()
-        XCTAssertNil(rejectedPrompt)
+    func testSilenceBoundaryFinalizesUtteranceAndStartsNextSegment() async throws {
+        let fixture = try await makeFixture(
+            partials: ["first", "first", "first", "second"],
+            finalText: "first sentence"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
 
-        await fixture.pipeline.updatePrompt("machine learning")
-        await fixture.pipeline.consume(try frame(samples: 16_000))
-        let acceptedPrompt = await fixture.recognizer.latestPrompt()
-        XCTAssertEqual(acceptedPrompt, "machine learning")
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -10))
+        await fixture.pipeline.consume(try frame(seconds: 0.6, decibels: -80))
+        await fixture.pipeline.consume(try frame(seconds: 0.6, decibels: -80))
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -10))
         await fixture.pipeline.finish()
+        let segments = await collector.value
+
+        let finalized = segments.filter { $0.isFinal && !$0.isGap }
+        XCTAssertEqual(finalized.count, 2)
+        XCTAssertEqual(finalized.map(\.id), ["segment-0", "segment-1"])
+        XCTAssertLessThan(finalized[0].end, finalized[1].end)
     }
 
-    func testEmptyRecognitionIsTreatedAsSilenceInsteadOfMissingAudio() async throws {
-        let fixture = try await makeFixture(behavior: .empty)
-        let collector = Task { () -> [LiveTranscriptSegment] in
-            var values: [LiveTranscriptSegment] = []
-            for await segment in fixture.pipeline.segments { values.append(segment) }
-            return values
-        }
+    func testLeadingSilenceDoesNotReachRecognizerOrCreateSegments() async throws {
+        let fixture = try await makeFixture(partials: [], finalText: "")
+        let collector = collectSegments(from: fixture.pipeline)
 
-        await fixture.pipeline.consume(try frame(samples: 32_000))
+        await fixture.pipeline.consume(try frame(seconds: 2, decibels: -80))
         await fixture.pipeline.finish()
 
         let segments = await collector.value
         XCTAssertTrue(segments.isEmpty)
+        let counts = await fixture.recognizer.counts()
+        XCTAssertEqual(counts.consumed, 0)
+        XCTAssertEqual(counts.finalized, 0)
     }
 
-    func testOutputsWithinOneWindowAreMergedAcrossShortPauses() async throws {
-        let outputs = [
-            SpeechRecognitionOutput(text: "This is a clause", start: 0, end: 1.4),
-            SpeechRecognitionOutput(text: "that continues after a pause.", start: 1.8, end: 3.2),
-        ]
-        let fixture = try await makeFixture(behavior: .outputs(outputs))
-        let collector = Task { () -> [LiveTranscriptSegment] in
-            var values: [LiveTranscriptSegment] = []
-            for await segment in fixture.pipeline.segments where segment.isFinal {
-                values.append(segment)
-            }
-            return values
-        }
+    func testPauseForcesFinalWithoutWaitingForSilence() async throws {
+        let fixture = try await makeFixture(partials: ["lecture"], finalText: "lecture complete")
+        let collector = collectSegments(from: fixture.pipeline)
 
-        await fixture.pipeline.consume(try frame(samples: 32_000))
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -8))
+        await fixture.pipeline.pause()
         await fixture.pipeline.finish()
-        let finalized = await collector.value
+        let finalized = await collector.value.filter { $0.isFinal && !$0.isGap }
 
-        XCTAssertEqual(finalized.count, 1)
-        XCTAssertEqual(finalized[0].text, "This is a clause that continues after a pause.")
-        XCTAssertEqual(finalized[0].start, 0)
-        XCTAssertEqual(finalized[0].end, 3.2)
+        XCTAssertEqual(finalized.map(\.text), ["lecture complete"])
+        let counts = await fixture.recognizer.counts()
+        XCTAssertEqual(counts.finalized, 1)
+    }
+
+    func testPausedPipelineIgnoresFramesUntilResume() async throws {
+        let fixture = try await makeFixture(
+            partials: ["before pause", "after resume"],
+            finalText: "final sentence"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
+
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -8))
+        await fixture.pipeline.pause()
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -8))
+        await fixture.pipeline.resume()
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -8))
+        await fixture.pipeline.finish()
+        _ = await collector.value
+
+        let counts = await fixture.recognizer.counts()
+        XCTAssertEqual(counts.consumed, 2)
+        XCTAssertEqual(counts.finalized, 2)
     }
 
     func testRecognitionFailureCreatesExplicitGapRevision() async throws {
-        let fixture = try await makeFixture(behavior: .failure)
-        let collector = Task { () -> [LiveTranscriptSegment] in
-            var values: [LiveTranscriptSegment] = []
-            for await segment in fixture.pipeline.segments { values.append(segment) }
-            return values
-        }
+        let fixture = try await makeFixture(partials: [], finalText: "", shouldFail: true)
+        let collector = collectSegments(from: fixture.pipeline)
 
-        await fixture.pipeline.consume(try frame(samples: 16_000))
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -10))
         await fixture.pipeline.finish()
         let segments = await collector.value
         let gap = try XCTUnwrap(segments.first { $0.isGap })
@@ -143,37 +145,57 @@ final class LiveTranscriptionTests: XCTestCase {
         }
         XCTAssertEqual(stored.count, 1)
         XCTAssertGreaterThan(stored[0].end, stored[0].start)
+        let counts = await fixture.recognizer.counts()
+        XCTAssertEqual(counts.reset, 1)
     }
 
-    private func frame(samples: Int) throws -> CapturedAudioFrame {
+    private func collectSegments(
+        from pipeline: LiveTranscriptionPipeline
+    ) -> Task<[LiveTranscriptSegment], Never> {
+        Task {
+            var values: [LiveTranscriptSegment] = []
+            for await segment in pipeline.segments { values.append(segment) }
+            return values
+        }
+    }
+
+    private func frame(seconds: Double, decibels: Float) throws -> CapturedAudioFrame {
         let format = try XCTUnwrap(
-            AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)
+            AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: false
+            )
         )
+        let samples = max(1, Int(seconds * 16_000))
         let buffer = try XCTUnwrap(
             AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples))
         )
         buffer.frameLength = AVAudioFrameCount(samples)
-        for index in 0..<samples { buffer.floatChannelData?[0][index] = 0.1 }
         return CapturedAudioFrame(
             buffer: buffer,
             capturedAt: .now,
-            activity: AudioActivityMeter.measure(buffer: buffer)
+            activity: AudioActivityLevel(
+                rootMeanSquare: decibels <= -80 ? 0 : pow(10, decibels / 20),
+                decibels: decibels
+            )
         )
     }
 
     private func makeFixture(
-        behavior: StubSpeechRecognizer.Behavior = .output("recognized lecture")
+        partials: [String],
+        finalText: String,
+        shouldFail: Bool = false
     ) async throws -> (
         pipeline: LiveTranscriptionPipeline,
-        recognizer: StubSpeechRecognizer,
+        recognizer: StubStreamingSpeechRecognizer,
         repository: SQLiteTranscriptRevisionRepository,
-        session: LectureSession,
-        databaseURL: URL
+        session: LectureSession
     ) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("live-transcription-\(UUID().uuidString).sqlite")
         let setup = try await MainActor.run { () -> (
-            LectureDatabase,
             SQLiteTranscriptRevisionRepository,
             LectureSession
         ) in
@@ -181,17 +203,22 @@ final class LiveTranscriptionTests: XCTestCase {
             try database.migrate()
             let session = LectureSession(title: "Transcription")
             try SQLiteLectureSessionRepository(database: database).save(session)
-            return (database, SQLiteTranscriptRevisionRepository(database: database), session)
+            return (SQLiteTranscriptRevisionRepository(database: database), session)
         }
-        let recognizer = StubSpeechRecognizer(behavior: behavior)
-        let pipeline = LiveTranscriptionPipeline(
-            sessionID: setup.2.id,
-            recognizer: recognizer,
-            repository: setup.1,
-            finalWindowSeconds: 2,
-            partialWindowSeconds: 1
+        let recognizer = StubStreamingSpeechRecognizer(
+            partials: partials,
+            finalText: finalText,
+            shouldFail: shouldFail
         )
-        _ = setup.0
-        return (pipeline, recognizer, setup.1, setup.2, url)
+        return (
+            LiveTranscriptionPipeline(
+                sessionID: setup.1.id,
+                recognizer: recognizer,
+                repository: setup.0
+            ),
+            recognizer,
+            setup.0,
+            setup.1
+        )
     }
 }

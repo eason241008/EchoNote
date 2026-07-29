@@ -41,19 +41,18 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
             state: .prepared,
             selectedDeviceID: String(preparation.deviceID),
             courseID: preparation.session.courseID,
-            transcriptionModel: SpeechModelDescriptor.smallEnglish.id
+            transcriptionModel: SpeechModelDescriptor.nemotronStreaming1120.id
         ))
 
         captionWorkspace.updateCaptureState("准备录音")
         captionWorkspace.updateTranscriptionState("正在加载本地模型")
-        let recognizer = try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
+        let recognizer = try await NemotronStreamingSpeechRecognizer(modelFolder: modelFolder)
         let transcriptRepository = SQLiteTranscriptRevisionRepository(database: database)
         let transcription = LiveTranscriptionPipeline(
             sessionID: preparation.session.id,
             recognizer: recognizer,
             repository: transcriptRepository
         )
-        await transcription.updatePrompt(preparation.session.title)
         let translation = makeTranslationPipeline()
         let capture = AVFoundationLectureCaptureService(storage: storage)
         try await capture.prepare(preparation)
@@ -121,6 +120,7 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
 
     public func pause() async throws {
         try await capture?.pause()
+        await transcription?.pause()
         captionWorkspace.updateCaptureState("已暂停")
         if var session = currentPreparation?.session {
             session.state = .paused
@@ -131,6 +131,7 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
 
     public func resume() async throws {
         try await capture?.resume()
+        await transcription?.resume()
         captionWorkspace.updateCaptureState("正在录音")
         if var session = currentPreparation?.session {
             session.state = .recording

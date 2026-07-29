@@ -1,17 +1,19 @@
+import FluidAudio
 import Foundation
-import WhisperKit
 
 public struct SpeechModelDescriptor: Equatable, Sendable {
     public let id: String
     public let displayName: String
     public let estimatedDownloadBytes: Int64
     public let requiredFreeBytes: Int64
+    public let relativePath: String
 
-    public static let smallEnglish = SpeechModelDescriptor(
-        id: "small.en",
-        displayName: "Whisper small.en",
-        estimatedDownloadBytes: 500_000_000,
-        requiredFreeBytes: 1_000_000_000
+    public static let nemotronStreaming1120 = SpeechModelDescriptor(
+        id: "nemotron-speech-streaming-en-0.6b-1120ms",
+        displayName: "Nemotron Streaming 0.6B · 1120 ms",
+        estimatedDownloadBytes: 600_000_000,
+        requiredFreeBytes: 1_500_000_000,
+        relativePath: NemotronChunkSize.ms1120.repo.folderName
     )
 }
 
@@ -35,7 +37,7 @@ public protocol SpeechModelValidating: Sendable {
     func validate(modelFolder: URL) async throws
 }
 
-public struct WhisperKitModelDownloader: SpeechModelDownloading {
+public struct FluidAudioModelDownloader: SpeechModelDownloading {
     public init() {}
 
     public func download(
@@ -43,29 +45,24 @@ public struct WhisperKitModelDownloader: SpeechModelDownloading {
         destination: URL,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
-        try await WhisperKit.download(
-            variant: descriptor.id,
-            downloadBase: destination,
-            progressCallback: { downloadProgress in
+        try await ModelHub.download(
+            .nemotronStreaming1120,
+            to: destination,
+            progressHandler: { downloadProgress in
                 progress(downloadProgress.fractionCompleted)
             }
         )
+        return destination.appendingPathComponent(descriptor.relativePath, isDirectory: true)
     }
 }
 
-public struct WhisperKitModelValidator: SpeechModelValidating {
+public struct FluidAudioModelValidator: SpeechModelValidating {
     public init() {}
 
     public func validate(modelFolder: URL) async throws {
-        let config = WhisperKitConfig(
-            model: SpeechModelDescriptor.smallEnglish.id,
-            modelFolder: modelFolder.path,
-            verbose: false,
-            prewarm: false,
-            load: true,
-            download: false
-        )
-        _ = try await WhisperKit(config)
+        let manager = StreamingNemotronAsrManager(requestedChunkSize: .ms1120)
+        try await manager.loadModels(from: modelFolder)
+        await manager.cleanup()
     }
 }
 
@@ -97,10 +94,10 @@ public final class SpeechModelManager: ObservableObject {
     private let fileManager: FileManager
 
     public init(
-        descriptor: SpeechModelDescriptor = .smallEnglish,
+        descriptor: SpeechModelDescriptor = .nemotronStreaming1120,
         modelsRootURL: URL,
-        downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
-        validator: any SpeechModelValidating = WhisperKitModelValidator(),
+        downloader: any SpeechModelDownloading = FluidAudioModelDownloader(),
+        validator: any SpeechModelValidating = FluidAudioModelValidator(),
         fileManager: FileManager = .default
     ) {
         self.descriptor = descriptor
@@ -108,7 +105,10 @@ public final class SpeechModelManager: ObservableObject {
         self.downloader = downloader
         self.validator = validator
         self.fileManager = fileManager
-        let installedURL = modelsRootURL.appendingPathComponent("openai_whisper-\(descriptor.id)")
+        let installedURL = modelsRootURL.appendingPathComponent(
+            descriptor.relativePath,
+            isDirectory: true
+        )
         state = fileManager.fileExists(atPath: installedURL.path) ? .verifying : .notInstalled
     }
 
@@ -116,6 +116,7 @@ public final class SpeechModelManager: ObservableObject {
         if case .ready = state { return true }
         return false
     }
+
     public var isBusy: Bool {
         switch state {
         case .downloading, .verifying: return true
@@ -134,15 +135,14 @@ public final class SpeechModelManager: ObservableObject {
     }
 
     public func refresh() async {
-        let candidates = installedCandidates()
-        guard let candidate = candidates.first else {
+        guard fileManager.fileExists(atPath: installedURL.path) else {
             state = .notInstalled
             return
         }
         state = .verifying
         do {
-            try await validator.validate(modelFolder: candidate)
-            state = .ready(candidate)
+            try await validator.validate(modelFolder: installedURL)
+            state = .ready(installedURL)
         } catch {
             state = .failed(SpeechModelManagerError.invalidModelDirectory.localizedDescription)
         }
@@ -180,25 +180,31 @@ public final class SpeechModelManager: ObservableObject {
     }
 
     public func remove() async throws {
-        for candidate in installedCandidates() {
-            do {
-                try fileManager.removeItem(at: candidate)
-            } catch {
-                state = .failed(SpeechModelManagerError.removalFailed.localizedDescription)
-                throw SpeechModelManagerError.removalFailed
-            }
+        guard fileManager.fileExists(atPath: installedURL.path) else {
+            state = .notInstalled
+            return
         }
-        state = .notInstalled
+        do {
+            try fileManager.removeItem(at: installedURL)
+            removeEmptyParentDirectories()
+            state = .notInstalled
+        } catch {
+            state = .failed(SpeechModelManagerError.removalFailed.localizedDescription)
+            throw SpeechModelManagerError.removalFailed
+        }
     }
 
-    private func installedCandidates() -> [URL] {
-        guard let enumerator = fileManager.enumerator(
-            at: modelsRootURL,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return enumerator.compactMap { $0 as? URL }.filter {
-            $0.lastPathComponent == "openai_whisper-\(descriptor.id)"
+    private var installedURL: URL {
+        modelsRootURL.appendingPathComponent(descriptor.relativePath, isDirectory: true)
+    }
+
+    private func removeEmptyParentDirectories() {
+        var directory = installedURL.deletingLastPathComponent()
+        while directory.path != modelsRootURL.path {
+            guard let contents = try? fileManager.contentsOfDirectory(atPath: directory.path),
+                  contents.isEmpty else { return }
+            try? fileManager.removeItem(at: directory)
+            directory.deleteLastPathComponent()
         }
     }
 

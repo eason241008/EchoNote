@@ -1,53 +1,35 @@
 import AVFoundation
+import FluidAudio
 import Foundation
-import WhisperKit
 
-public struct SpeechRecognitionOutput: Equatable, Sendable {
-    public let text: String
-    public let start: TimeInterval
-    public let end: TimeInterval
-
-    public init(text: String, start: TimeInterval, end: TimeInterval) {
-        self.text = text
-        self.start = start
-        self.end = end
-    }
+public protocol StreamingSpeechRecognizing: Sendable {
+    func consume(_ buffer: AVAudioPCMBuffer) async throws -> String
+    func finalize() async throws -> String
+    func reset() async
 }
 
-public protocol LocalSpeechRecognizing: Sendable {
-    func transcribe(samples: [Float], prompt: String?) async throws -> [SpeechRecognitionOutput]
-}
-
-public actor WhisperKitSpeechRecognizer: LocalSpeechRecognizing {
-    private let whisperKit: WhisperKit
+public actor NemotronStreamingSpeechRecognizer: StreamingSpeechRecognizing {
+    private let manager: StreamingNemotronAsrManager
 
     public init(modelFolder: URL) async throws {
-        whisperKit = try await WhisperKit(WhisperKitConfig(
-            model: SpeechModelDescriptor.smallEnglish.id,
-            modelFolder: modelFolder.path,
-            verbose: false,
-            prewarm: false,
-            load: true,
-            download: false
-        ))
+        let manager = StreamingNemotronAsrManager(requestedChunkSize: .ms1120)
+        try await manager.loadModels(from: modelFolder)
+        self.manager = manager
     }
 
-    public func transcribe(samples: [Float], prompt: String?) async throws -> [SpeechRecognitionOutput] {
-        var options = DecodingOptions(language: "en", wordTimestamps: true)
-        if let prompt, !prompt.isEmpty, let tokenizer = whisperKit.tokenizer {
-            options.promptTokens = tokenizer.encode(text: " \(prompt)")
-        }
-        let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: options)
-        return results.flatMap(\.segments).compactMap {
-            let text = sanitizeTranscript($0.text)
-            guard !text.isEmpty else { return nil }
-            return SpeechRecognitionOutput(text: text, start: Double($0.start), end: Double($0.end))
-        }
+    public func consume(_ buffer: AVAudioPCMBuffer) async throws -> String {
+        _ = try await manager.process(audioBuffer: buffer)
+        return await manager.getPartialTranscript()
     }
 
-    private func sanitizeTranscript(_ text: String) -> String {
-        text.replacingOccurrences(of: #"<\|[^|]+\|>"#, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    public func finalize() async throws -> String {
+        let transcript = try await manager.finish()
+        await manager.reset()
+        return transcript
+    }
+
+    public func reset() async {
+        await manager.reset()
     }
 }
 
@@ -84,16 +66,17 @@ public struct LiveTranscriptSegment: Equatable, Sendable {
 
 public actor LiveTranscriptionPipeline {
     private let sessionID: SessionID
-    private let recognizer: any LocalSpeechRecognizing
+    private let recognizer: any StreamingSpeechRecognizing
     private let repository: SQLiteTranscriptRevisionRepository?
-    private let sampleRate = 16_000
-    private let finalWindowSamples: Int
-    private let partialWindowSamples: Int
-    private var pendingSamples: [Float] = []
-    private var consumedSamples = 0
+    private let silenceThresholdDecibels: Float
+    private let finalSilenceSeconds: TimeInterval
+    private var timelineSeconds: TimeInterval = 0
+    private var utteranceStart: TimeInterval?
+    private var silenceSeconds: TimeInterval = 0
     private var segmentIndex = 0
-    private var prompt: String?
+    private var lastPartial = ""
     private var lastCapturedAt: ContinuousClock.Instant?
+    private var isSuspended = false
     private let latencyTracker: CaptionLatencyTracker
     private let latencyStream: BoundedAsyncStream<CaptionLatencyStatus>
     private let outputStream: BoundedAsyncStream<LiveTranscriptSegment>
@@ -102,19 +85,19 @@ public actor LiveTranscriptionPipeline {
 
     public init(
         sessionID: SessionID,
-        recognizer: any LocalSpeechRecognizing,
+        recognizer: any StreamingSpeechRecognizing,
         repository: SQLiteTranscriptRevisionRepository? = nil,
-        finalWindowSeconds: Double = 10,
-        partialWindowSeconds: Double = 1,
+        silenceThresholdDecibels: Float = -50,
+        finalSilenceSeconds: TimeInterval = 1.2,
         outputBufferLimit: Int = 32,
         latencyTracker: CaptionLatencyTracker = CaptionLatencyTracker()
     ) {
         self.sessionID = sessionID
         self.recognizer = recognizer
         self.repository = repository
+        self.silenceThresholdDecibels = silenceThresholdDecibels
+        self.finalSilenceSeconds = finalSilenceSeconds
         self.latencyTracker = latencyTracker
-        finalWindowSamples = max(1, Int(finalWindowSeconds * Double(sampleRate)))
-        partialWindowSamples = max(1, Int(partialWindowSeconds * Double(sampleRate)))
         let outputStream = BoundedAsyncStream<LiveTranscriptSegment>(limit: outputBufferLimit)
         self.outputStream = outputStream
         segments = outputStream.stream
@@ -123,179 +106,146 @@ public actor LiveTranscriptionPipeline {
         latencyStatuses = latencyStream.stream
     }
 
-    public func updatePrompt(_ prompt: String?) {
-        self.prompt = Self.englishPrompt(from: prompt)
-    }
-
-    static func englishPrompt(from prompt: String?) -> String? {
-        guard let prompt else { return nil }
-        let normalized = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else { return nil }
-        let letters = normalized.unicodeScalars.filter { CharacterSet.letters.contains($0) }
-        guard !letters.isEmpty,
-              letters.allSatisfy({ $0.isASCII }) else { return nil }
-        return normalized
-    }
-
     public func consume(_ frame: CapturedAudioFrame) async {
+        guard !isSuspended else { return }
+        let duration = frameDuration(frame.buffer)
+        let frameStart = timelineSeconds
+        timelineSeconds += duration
         lastCapturedAt = frame.capturedAt
+        let containsSpeech = frame.activity.decibels > silenceThresholdDecibels
+
+        guard utteranceStart != nil || containsSpeech else { return }
+        if utteranceStart == nil {
+            utteranceStart = frameStart
+            silenceSeconds = 0
+        }
+        silenceSeconds = containsSpeech ? 0 : silenceSeconds + duration
+
         do {
-            pendingSamples.append(contentsOf: try frame.buffer.samples16kMono())
+            let partial = normalized(try await recognizer.consume(frame.buffer))
+            if !partial.isEmpty, partial != lastPartial {
+                lastPartial = partial
+                await emit(text: partial, final: false, completedAt: frame.capturedAt)
+            }
+            if silenceSeconds >= finalSilenceSeconds {
+                await finalizeUtterance(completedAt: frame.capturedAt)
+            }
         } catch {
-            await emitGap(sampleCount: Int(frame.buffer.frameLength), reason: "Audio conversion failed")
-            return
+            await emitGap(reason: error.localizedDescription, completedAt: frame.capturedAt)
         }
-        if pendingSamples.count >= finalWindowSamples {
-            let window = Array(pendingSamples.prefix(finalWindowSamples))
-            pendingSamples.removeFirst(finalWindowSamples)
-            await recognize(window, final: true, windowCompletedAt: frame.capturedAt)
-        } else if pendingSamples.count >= partialWindowSamples,
-                  pendingSamples.count % partialWindowSamples < Int(frame.buffer.frameLength) {
-            await recognize(pendingSamples, final: false, windowCompletedAt: frame.capturedAt)
-        }
+    }
+
+    public func pause() async {
+        isSuspended = true
+        await finalizeUtterance(completedAt: lastCapturedAt ?? .now)
+    }
+
+    public func resume() {
+        isSuspended = false
     }
 
     public func finish() async {
-        if !pendingSamples.isEmpty {
-            let samples = pendingSamples
-            pendingSamples.removeAll(keepingCapacity: false)
-            await recognize(
-                samples,
-                final: true,
-                windowCompletedAt: lastCapturedAt ?? .now
-            )
-        }
+        await finalizeUtterance(completedAt: lastCapturedAt ?? .now)
         outputStream.finish()
         latencyStream.finish()
     }
 
-    private func recognize(
-        _ samples: [Float],
-        final: Bool,
-        windowCompletedAt: ContinuousClock.Instant
-    ) async {
-        let windowStart = Double(consumedSamples) / Double(sampleRate)
+    private func finalizeUtterance(completedAt: ContinuousClock.Instant) async {
+        guard let start = utteranceStart else { return }
         do {
-            let outputs = try await recognizer.transcribe(samples: samples, prompt: prompt)
-            guard let output = Self.mergedOutput(outputs) else {
-                if final { consumedSamples += samples.count }
-                return
-            }
-            let segmentID = "segment-\(segmentIndex)"
-            let revision: TranscriptRevision?
-            if final, let repository {
-                revision = try? await repository.createRevision(
+            let finalText = normalized(try await recognizer.finalize())
+            if !finalText.isEmpty {
+                let segmentID = "segment-\(segmentIndex)"
+                let revision = try? await repository?.createRevision(
                     sessionID: sessionID,
                     segmentID: segmentID,
-                    startsAt: windowStart + output.start,
-                    endsAt: windowStart + output.end,
-                    text: output.text,
+                    startsAt: start,
+                    endsAt: timelineSeconds,
+                    text: finalText,
                     status: .finalized
                 )
-            } else {
-                revision = nil
+                outputStream.yield(LiveTranscriptSegment(
+                    id: segmentID,
+                    sessionID: sessionID,
+                    start: start,
+                    end: timelineSeconds,
+                    text: finalText,
+                    isFinal: true,
+                    revisionID: revision?.id
+                ))
+                await recordLatency(completedAt)
+                segmentIndex += 1
             }
-            let segment = LiveTranscriptSegment(
-                id: segmentID,
-                sessionID: sessionID,
-                start: windowStart + output.start,
-                end: windowStart + output.end,
-                text: output.text,
-                isFinal: final,
-                revisionID: revision?.id
-            )
-            outputStream.yield(segment)
-            if final { segmentIndex += 1 }
-            let latency = await latencyTracker.record(windowCompletedAt: windowCompletedAt)
-            latencyStream.yield(latency)
-            if final { consumedSamples += samples.count }
+            resetUtterance()
         } catch {
-            if final {
-                await emitGap(sampleCount: samples.count, reason: error.localizedDescription)
-            }
+            await emitGap(reason: error.localizedDescription, completedAt: completedAt)
         }
     }
 
-    static func mergedOutput(_ outputs: [SpeechRecognitionOutput]) -> SpeechRecognitionOutput? {
-        let usable = outputs.filter {
-            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-        guard let first = usable.first, let last = usable.last else { return nil }
-        let text = usable.map(\.text)
-            .joined(separator: " ")
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return SpeechRecognitionOutput(text: text, start: first.start, end: last.end)
+    private func emit(
+        text: String,
+        final: Bool,
+        completedAt: ContinuousClock.Instant
+    ) async {
+        guard let start = utteranceStart else { return }
+        outputStream.yield(LiveTranscriptSegment(
+            id: "segment-\(segmentIndex)",
+            sessionID: sessionID,
+            start: start,
+            end: timelineSeconds,
+            text: text,
+            isFinal: final
+        ))
+        await recordLatency(completedAt)
     }
 
-    private func emitGap(sampleCount: Int, reason: String) async {
-        let start = Double(consumedSamples) / Double(sampleRate)
-        let end = start + Double(sampleCount) / Double(sampleRate)
+    private func emitGap(
+        reason: String,
+        completedAt: ContinuousClock.Instant
+    ) async {
+        guard let start = utteranceStart else { return }
+        await recognizer.reset()
         let segmentID = "gap-\(segmentIndex)"
-        let gap = LiveTranscriptSegment(
+        outputStream.yield(LiveTranscriptSegment(
             id: segmentID,
             sessionID: sessionID,
             start: start,
-            end: end,
+            end: timelineSeconds,
             text: reason,
             isFinal: true,
             isGap: true
+        ))
+        _ = try? await repository?.createRevision(
+            sessionID: sessionID,
+            segmentID: segmentID,
+            startsAt: start,
+            endsAt: timelineSeconds,
+            text: reason,
+            status: .gap
         )
-        outputStream.yield(gap)
-        if let repository {
-            _ = try? await repository.createRevision(
-                sessionID: sessionID,
-                segmentID: segmentID,
-                startsAt: start,
-                endsAt: end,
-                text: reason,
-                status: .gap
-            )
-        }
-        consumedSamples += sampleCount
+        await recordLatency(completedAt)
         segmentIndex += 1
+        resetUtterance()
     }
-}
 
-public enum AudioConversionError: Error {
-    case unsupportedFormat
-    case conversionFailed
-}
+    private func resetUtterance() {
+        utteranceStart = nil
+        silenceSeconds = 0
+        lastPartial = ""
+    }
 
-private extension AVAudioPCMBuffer {
-    func samples16kMono() throws -> [Float] {
-        let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 16_000,
-            channels: 1,
-            interleaved: false
-        )!
-        if format.sampleRate == 16_000, format.channelCount == 1,
-           let channel = floatChannelData?[0] {
-            return Array(UnsafeBufferPointer(start: channel, count: Int(frameLength)))
-        }
-        guard let converter = AVAudioConverter(from: format, to: targetFormat) else {
-            throw AudioConversionError.unsupportedFormat
-        }
-        let ratio = targetFormat.sampleRate / format.sampleRate
-        let capacity = AVAudioFrameCount(ceil(Double(frameLength) * ratio))
-        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
-            throw AudioConversionError.unsupportedFormat
-        }
-        var supplied = false
-        var conversionError: NSError?
-        let status = converter.convert(to: output, error: &conversionError) { _, inputStatus in
-            if supplied {
-                inputStatus.pointee = .endOfStream
-                return nil
-            }
-            supplied = true
-            inputStatus.pointee = .haveData
-            return self
-        }
-        guard status != .error, conversionError == nil, let channel = output.floatChannelData?[0] else {
-            throw AudioConversionError.conversionFailed
-        }
-        return Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
+    private func recordLatency(_ completedAt: ContinuousClock.Instant) async {
+        let latency = await latencyTracker.record(windowCompletedAt: completedAt)
+        latencyStream.yield(latency)
+    }
+
+    private func frameDuration(_ buffer: AVAudioPCMBuffer) -> TimeInterval {
+        guard buffer.format.sampleRate > 0 else { return 0 }
+        return Double(buffer.frameLength) / buffer.format.sampleRate
+    }
+
+    private func normalized(_ text: String) -> String {
+        text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

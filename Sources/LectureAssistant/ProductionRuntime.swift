@@ -51,7 +51,7 @@ public final class ProductionRuntime: ObservableObject {
 
         let storage = SessionStorage(rootURL: sessionsURL)
         let modelFolder = modelsURL.appendingPathComponent(
-            "openai_whisper-\(SpeechModelDescriptor.smallEnglish.id)",
+            SpeechModelDescriptor.nemotronStreaming1120.relativePath,
             isDirectory: true
         )
         let capture = ProductionLectureCaptureService(

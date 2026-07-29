@@ -4,12 +4,12 @@ import XCTest
 
 final class RealSpeechModelTests: XCTestCase {
     @MainActor
-    func testDownloadsValidatesAndRemovesSmallEnglishModel() async throws {
+    func testDownloadsValidatesAndRemovesNemotronStreamingModel() async throws {
         guard ProcessInfo.processInfo.environment["LECTURE_ASSISTANT_REAL_MODEL"] == "1" else {
-            throw XCTSkip("Set LECTURE_ASSISTANT_REAL_MODEL=1 to exercise WhisperKit download.")
+            throw XCTSkip("Set LECTURE_ASSISTANT_REAL_MODEL=1 to exercise FluidAudio model download.")
         }
         let rootURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("real-whisperkit-model-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("real-nemotron-model-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: rootURL) }
         let manager = SpeechModelManager(modelsRootURL: rootURL)
 

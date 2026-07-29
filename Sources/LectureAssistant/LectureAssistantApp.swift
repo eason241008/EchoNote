@@ -906,7 +906,7 @@ private struct SettingsPage: View {
                 VStack(alignment: .leading, spacing: 14) {
                     Label("本地英文转写模型", systemImage: "waveform")
                         .font(.headline)
-                    Text("Whisper small.en · 约 500 MB。下载并验证成功后才能开始录音。")
+                    Text("Nemotron Streaming 0.6B · 1120 ms · 约 600 MB。使用 Apple Neural Engine 进行低延迟本地英文转写。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     if case let .downloading(progress) = speechModel.state {

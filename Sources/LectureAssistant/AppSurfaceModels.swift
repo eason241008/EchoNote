@@ -268,9 +268,11 @@ public final class RuntimeSettingsModel: ObservableObject {
     }
 
     public func refresh() {
-        modelInstalled = FileManager.default.fileExists(
-            atPath: modelsRootURL.appendingPathComponent("openai_whisper-small.en").path
+        let modelURL = modelsRootURL.appendingPathComponent(
+            SpeechModelDescriptor.nemotronStreaming1120.relativePath,
+            isDirectory: true
         )
+        modelInstalled = FileManager.default.fileExists(atPath: modelURL.path)
         modelSize = directorySize(modelsRootURL)
         storageSize = directorySize(applicationSupportURL)
     }

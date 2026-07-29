@@ -34,7 +34,7 @@ final class SpeechModelManagerTests: XCTestCase {
     func testExplicitDownloadValidatesAndBecomesReady() async throws {
         let rootURL = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: rootURL) }
-        let folder = rootURL.appendingPathComponent("openai_whisper-small.en")
+        let folder = modelFolder(in: rootURL)
         let manager = SpeechModelManager(
             modelsRootURL: rootURL,
             downloader: StubModelDownloader(modelFolder: folder),
@@ -52,7 +52,7 @@ final class SpeechModelManagerTests: XCTestCase {
     @MainActor
     func testRemoveDeletesInstalledModelAndClearsReadiness() async throws {
         let rootURL = temporaryRoot()
-        let folder = rootURL.appendingPathComponent("openai_whisper-small.en")
+        let folder = modelFolder(in: rootURL)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: rootURL) }
         let manager = SpeechModelManager(
@@ -73,7 +73,7 @@ final class SpeechModelManagerTests: XCTestCase {
     func testFailedValidationNeverReportsReady() async {
         enum ExpectedFailure: Error { case invalid }
         let rootURL = temporaryRoot()
-        let folder = rootURL.appendingPathComponent("openai_whisper-small.en")
+        let folder = modelFolder(in: rootURL)
         defer { try? FileManager.default.removeItem(at: rootURL) }
         let manager = SpeechModelManager(
             modelsRootURL: rootURL,
@@ -95,10 +95,18 @@ final class SpeechModelManagerTests: XCTestCase {
 
     @MainActor
     func testDescriptorDisclosesDownloadAndDiskRequirements() {
-        let descriptor = SpeechModelDescriptor.smallEnglish
-        XCTAssertEqual(descriptor.id, "small.en")
+        let descriptor = SpeechModelDescriptor.nemotronStreaming1120
+        XCTAssertEqual(descriptor.id, "nemotron-speech-streaming-en-0.6b-1120ms")
+        XCTAssertEqual(descriptor.relativePath, "nemotron-streaming/1120ms")
         XCTAssertGreaterThan(descriptor.estimatedDownloadBytes, 0)
         XCTAssertGreaterThanOrEqual(descriptor.requiredFreeBytes, descriptor.estimatedDownloadBytes)
+    }
+
+    private func modelFolder(in rootURL: URL) -> URL {
+        rootURL.appendingPathComponent(
+            SpeechModelDescriptor.nemotronStreaming1120.relativePath,
+            isDirectory: true
+        )
     }
 
     private func temporaryRoot() -> URL {
