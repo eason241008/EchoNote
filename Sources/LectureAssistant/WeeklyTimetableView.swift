@@ -7,7 +7,6 @@ struct WeeklyTimetableView: View {
     private let calendar: Calendar
     private let firstHour = 8
     private let lastHour = 20
-    private let hourHeight: CGFloat = 66
     private let timeColumnWidth: CGFloat = 58
 
     init(events: [ICSCourseEvent], weekOffset: Binding<Int>) {
@@ -23,54 +22,61 @@ struct WeeklyTimetableView: View {
 
     var body: some View {
         GeometryReader { proxy in
+            let headerHeight: CGFloat = 56
+            let gridHeight = max(1, proxy.size.height - headerHeight - 1)
+            let hourHeight = gridHeight / CGFloat(lastHour - firstHour)
             let layout = layout(for: proxy.size.width)
-            ScrollView(.horizontal) {
-                VStack(spacing: 0) {
-                    header(dayColumnWidth: layout.dayColumnWidth)
-                    Divider().opacity(0.7)
-                    ScrollView(.vertical) {
-                        ZStack(alignment: .topLeading) {
-                            grid(
-                                dayColumnWidth: layout.dayColumnWidth,
-                                contentWidth: layout.contentWidth
-                            )
-                            eventBlocks(dayColumnWidth: layout.dayColumnWidth)
-                        }
-                        .frame(
-                            width: layout.contentWidth,
-                            height: hourHeight * CGFloat(lastHour - firstHour)
-                        )
-                    }
-                    .frame(height: 620)
+
+            VStack(spacing: 0) {
+                header(dayColumnWidth: layout.dayColumnWidth, height: headerHeight)
+                Divider().opacity(0.7)
+                ZStack(alignment: .topLeading) {
+                    grid(
+                        dayColumnWidth: layout.dayColumnWidth,
+                        contentWidth: layout.contentWidth,
+                        hourHeight: hourHeight
+                    )
+                    eventBlocks(
+                        dayColumnWidth: layout.dayColumnWidth,
+                        hourHeight: hourHeight
+                    )
                 }
-                .frame(width: layout.contentWidth)
+                .frame(
+                    width: layout.contentWidth,
+                    height: gridHeight
+                )
             }
+            .frame(width: layout.contentWidth, height: proxy.size.height)
         }
-        .frame(height: 684)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(nsColor: .separatorColor).opacity(0.72)))
         .clipShape(RoundedRectangle(cornerRadius: 18))
     }
 
-    private func header(dayColumnWidth: CGFloat) -> some View {
+    private func header(dayColumnWidth: CGFloat, height: CGFloat) -> some View {
         HStack(spacing: 0) {
-            Color.clear.frame(width: timeColumnWidth, height: 62)
+            Color.clear.frame(width: timeColumnWidth, height: height)
             ForEach(days, id: \.self) { day in
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     Text(day.formatted(.dateTime.weekday(.wide)))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text(day.formatted(.dateTime.day()))
-                        .font(.system(size: 18, weight: calendar.isDateInToday(day) ? .bold : .semibold, design: .rounded))
+                        .font(.system(size: 17, weight: calendar.isDateInToday(day) ? .bold : .semibold, design: .rounded))
                         .foregroundStyle(calendar.isDateInToday(day) ? Color.accentColor : Color.primary)
                 }
-                .frame(width: dayColumnWidth, height: 62)
+                .frame(width: dayColumnWidth, height: height)
                 .background(calendar.isDateInToday(day) ? Color.accentColor.opacity(0.09) : .clear)
             }
         }
     }
 
-    private func grid(dayColumnWidth: CGFloat, contentWidth: CGFloat) -> some View {
+    private func grid(
+        dayColumnWidth: CGFloat,
+        contentWidth: CGFloat,
+        hourHeight: CGFloat
+    ) -> some View {
         ZStack(alignment: .topLeading) {
             ForEach(0...lastHour - firstHour, id: \.self) { index in
                 let y = CGFloat(index) * hourHeight
@@ -85,7 +91,7 @@ struct WeeklyTimetableView: View {
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                         .frame(width: timeColumnWidth - 8, alignment: .trailing)
-                        .offset(y: index == 0 ? 6 : y - 7)
+                        .offset(y: index == 0 ? 5 : y - 7)
                 }
             }
 
@@ -100,17 +106,17 @@ struct WeeklyTimetableView: View {
         }
     }
 
-    private func eventBlocks(dayColumnWidth: CGFloat) -> some View {
+    private func eventBlocks(dayColumnWidth: CGFloat, hourHeight: CGFloat) -> some View {
         ForEach(Array(visibleEvents.enumerated()), id: \.offset) { _, event in
             if let dayIndex = days.firstIndex(where: { calendar.isDate($0, inSameDayAs: event.startsAt) }) {
                 TimetableEventBlock(event: event)
                     .frame(
-                        width: dayColumnWidth - 10,
-                        height: max(44, blockHeight(for: event))
+                        width: max(1, dayColumnWidth - 10),
+                        height: max(30, blockHeight(for: event, hourHeight: hourHeight))
                     )
                     .offset(
                         x: timeColumnWidth + CGFloat(dayIndex) * dayColumnWidth + 5,
-                        y: yOffset(for: event)
+                        y: yOffset(for: event, hourHeight: hourHeight)
                     )
             }
         }
@@ -132,23 +138,21 @@ struct WeeklyTimetableView: View {
     }
 
     private func layout(for availableWidth: CGFloat) -> (contentWidth: CGFloat, dayColumnWidth: CGFloat) {
-        let minimumDayWidth: CGFloat = 132
-        let minimumContentWidth = timeColumnWidth + minimumDayWidth * CGFloat(days.count)
-        let contentWidth = max(minimumContentWidth, availableWidth)
+        let contentWidth = max(timeColumnWidth + 1, availableWidth)
         return (
             contentWidth,
             (contentWidth - timeColumnWidth) / CGFloat(max(1, days.count))
         )
     }
 
-    private func yOffset(for event: ICSCourseEvent) -> CGFloat {
+    private func yOffset(for event: ICSCourseEvent, hourHeight: CGFloat) -> CGFloat {
         let components = calendar.dateComponents([.hour, .minute], from: event.startsAt)
         let hour = CGFloat((components.hour ?? firstHour) - firstHour)
         let minute = CGFloat(components.minute ?? 0) / 60
         return max(0, (hour + minute) * hourHeight)
     }
 
-    private func blockHeight(for event: ICSCourseEvent) -> CGFloat {
+    private func blockHeight(for event: ICSCourseEvent, hourHeight: CGFloat) -> CGFloat {
         CGFloat(event.endsAt.timeIntervalSince(event.startsAt) / 3600) * hourHeight - 4
     }
 }

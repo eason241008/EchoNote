@@ -142,23 +142,32 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 220, ideal: 236, max: 260)
+                .navigationSplitViewColumnWidth(min: 270, ideal: 286, max: 310)
         } detail: {
             ZStack {
                 AppPalette.canvas.ignoresSafeArea()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
+                if selection == .schedule {
+                    VStack(alignment: .leading, spacing: 18) {
                         pageHeader
                         pageContent
                     }
-                    .padding(32)
-                    .frame(maxWidth: 980, alignment: .leading)
+                    .padding(28)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 24) {
+                            pageHeader
+                            pageContent
+                        }
+                        .padding(32)
+                        .frame(maxWidth: 980, alignment: .leading)
+                    }
                 }
             }
         }
         .navigationSplitViewStyle(.balanced)
         .tint(AppPalette.sage)
-        .frame(minWidth: 940, minHeight: 640)
+        .frame(minWidth: 1080, minHeight: 700)
         .preferredColorScheme(.dark)
         .task {
             await speechModel.refresh()
@@ -191,60 +200,62 @@ struct ContentView: View {
     private var sidebar: some View {
         ZStack {
             AppPalette.sidebar.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 20) {
-                HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 26) {
+                HStack(spacing: 14) {
                     ZStack {
-                        RoundedRectangle(cornerRadius: 12)
+                        RoundedRectangle(cornerRadius: 14)
                             .fill(AppPalette.sage)
-                            .frame(width: 42, height: 42)
+                            .frame(width: 48, height: 48)
                         Image(systemName: "graduationcap.fill")
-                            .font(.system(size: 19, weight: .semibold))
+                            .font(.system(size: 21, weight: .semibold))
                             .foregroundStyle(.white)
                     }
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text("EchoNote 声译")
-                            .font(.system(size: 18, weight: .semibold))
+                            .font(.system(size: 19, weight: .semibold))
                             .foregroundStyle(AppPalette.primary)
                         Text("Live Lecture Companion")
-                            .font(.caption2)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 22)
+                .padding(.horizontal, 20)
+                .padding(.top, 24)
 
-                VStack(spacing: 6) {
+                VStack(spacing: 10) {
                     ForEach(AppSection.allCases) { section in
                         Button {
                             withAnimation(.easeOut(duration: 0.18)) {
                                 selection = section
                             }
                         } label: {
-                            HStack(spacing: 12) {
+                            HStack(spacing: 14) {
                                 Image(systemName: section.icon)
-                                    .font(.system(size: 16, weight: .medium))
-                                    .frame(width: 22)
+                                    .font(.system(size: 18, weight: .medium))
+                                    .frame(width: 26)
                                 Text(section.title)
-                                    .font(.system(size: 14, weight: .medium))
+                                    .font(.system(size: 15, weight: .medium))
                                 Spacer()
                             }
                             .foregroundStyle(selection == section ? AppPalette.primary : .secondary)
+                            .padding(.horizontal, 18)
+                            .frame(maxWidth: .infinity, minHeight: 52)
                             .contentShape(Rectangle())
                             .background(
-                                RoundedRectangle(cornerRadius: 12)
+                                RoundedRectangle(cornerRadius: 14)
                                     .fill(
                                         selection == section
                                             ? Color(nsColor: .selectedContentBackgroundColor).opacity(0.48)
                                             : .clear
                                     )
                             )
-                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .contentShape(Rectangle())
                         .accessibilityLabel(section.title)
                     }
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 14)
 
                 Spacer()
 
@@ -521,9 +532,9 @@ private struct SchedulePage: View {
     @State private var weekOffset = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(weekTitle)
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(AppPalette.primary)
@@ -536,7 +547,7 @@ private struct SchedulePage: View {
                     weekOffset -= 1
                 } label: {
                     Image(systemName: "chevron.left")
-                        .frame(width: 18)
+                        .frame(width: 20)
                 }
                 .buttonStyle(SecondaryActionButtonStyle())
                 .help("上一周")
@@ -550,7 +561,7 @@ private struct SchedulePage: View {
                     weekOffset += 1
                 } label: {
                     Image(systemName: "chevron.right")
-                        .frame(width: 18)
+                        .frame(width: 20)
                 }
                 .buttonStyle(SecondaryActionButtonStyle())
                 .help("下一周")
@@ -576,8 +587,7 @@ private struct SchedulePage: View {
                         Button("选择日历文件") { isImporting = true }
                             .buttonStyle(SecondaryActionButtonStyle())
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 46)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
                 WeeklyTimetableView(events: store.events, weekOffset: $weekOffset)
@@ -587,6 +597,7 @@ private struct SchedulePage: View {
                 InlineNotice(icon: "checkmark.circle.fill", text: importMessage, tint: AppPalette.sage)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .fileImporter(
             isPresented: $isImporting,
             allowedContentTypes: [.calendarEvent, .data],
@@ -1192,10 +1203,10 @@ private struct InteractiveButtonBody: View {
 
     var body: some View {
         configuration.label
-            .font(.system(size: 13, weight: weight))
+            .font(.system(size: 14, weight: weight))
             .foregroundStyle(foreground)
-            .padding(.horizontal, 16)
-            .frame(height: 38)
+            .padding(.horizontal, 20)
+            .frame(minWidth: 44, minHeight: 44)
             .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 10)
