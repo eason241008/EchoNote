@@ -226,18 +226,52 @@ public enum LibraryExportFormat: String, CaseIterable, Identifiable {
     public var title: String { rawValue.uppercased() }
 }
 
+public enum MicrophoneSensitivity: String, CaseIterable, Identifiable, Sendable {
+    case near
+    case standard
+    case far
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .near: return "近距离"
+        case .standard: return "标准"
+        case .far: return "远距离"
+        }
+    }
+
+    public var guidance: String {
+        switch self {
+        case .near: return "电脑就在你面前，减少环境杂音"
+        case .standard: return "一般座位距离，平衡人声与底噪"
+        case .far: return "离电脑较远，更容易捕捉较轻的人声"
+        }
+    }
+
+    public var speechActivationDecibels: Float {
+        switch self {
+        case .near: return -32
+        case .standard: return -38
+        case .far: return -48
+        }
+    }
+}
+
 @MainActor
 public final class RuntimeSettingsModel: ObservableObject {
     @Published public private(set) var modelInstalled = false
     @Published public private(set) var modelSize: Int64 = 0
     @Published public private(set) var storageSize: Int64 = 0
     @Published public private(set) var retentionDays: Int
+    @Published public private(set) var microphoneSensitivity: MicrophoneSensitivity
 
     public let applicationSupportURL: URL
     public let modelsRootURL: URL
     public var timetableURL: URL? { timetable.subscriptionURL }
     private let defaults: UserDefaults
     private let retentionKey = "lecture-assistant.retention-days"
+    private let microphoneSensitivityKey = "lecture-assistant.microphone-sensitivity"
     private let timetable: TimetableStore
 
     public init(
@@ -251,12 +285,19 @@ public final class RuntimeSettingsModel: ObservableObject {
         self.timetable = timetable
         self.defaults = defaults
         retentionDays = defaults.object(forKey: retentionKey) == nil ? 30 : defaults.integer(forKey: retentionKey)
+        microphoneSensitivity = defaults.string(forKey: microphoneSensitivityKey)
+            .flatMap(MicrophoneSensitivity.init(rawValue:)) ?? .standard
         refresh()
     }
 
     public func setRetentionDays(_ days: Int) {
         retentionDays = min(365, max(0, days))
         defaults.set(retentionDays, forKey: retentionKey)
+    }
+
+    public func setMicrophoneSensitivity(_ sensitivity: MicrophoneSensitivity) {
+        microphoneSensitivity = sensitivity
+        defaults.set(sensitivity.rawValue, forKey: microphoneSensitivityKey)
     }
 
     public func setTimetableURL(_ value: String) async {

@@ -42,12 +42,13 @@ public final class ProductionRuntime: ObservableObject {
         self.captionWorkspace = captionWorkspace
         self.timetable = timetable
         library = LectureLibraryModel(database: database, sessionRoot: sessionsURL)
-        settings = RuntimeSettingsModel(
+        let runtimeSettings = RuntimeSettingsModel(
             applicationSupportURL: baseURL,
             modelsRootURL: modelsURL,
             timetable: timetable,
             defaults: defaults
         )
+        settings = runtimeSettings
 
         let storage = SessionStorage(rootURL: sessionsURL)
         let modelFolder = modelsURL.appendingPathComponent(
@@ -59,7 +60,10 @@ public final class ProductionRuntime: ObservableObject {
             database: database,
             modelFolder: modelFolder,
             captionWorkspace: captionWorkspace,
-            translationProvider: translationProvider
+            translationProvider: translationProvider,
+            speechActivationDecibels: {
+                runtimeSettings.microphoneSensitivity.speechActivationDecibels
+            }
         )
         let services = ApplicationServices(
             scheduling: EmptyCourseSchedulingService(),

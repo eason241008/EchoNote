@@ -65,7 +65,7 @@ final class AppSurfaceModelsTests: XCTestCase {
         XCTAssertEqual(states["Legacy prepared"], .completed)
     }
 
-    func testRuntimeSettingsPersistsBoundedRetention() throws {
+    func testRuntimeSettingsPersistsBoundedRetentionAndMicrophoneSensitivity() throws {
         let suiteName = #function
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
@@ -84,6 +84,8 @@ final class AppSurfaceModelsTests: XCTestCase {
         )
         model.setRetentionDays(400)
         XCTAssertEqual(model.retentionDays, 365)
+        model.setMicrophoneSensitivity(.far)
+        XCTAssertEqual(model.microphoneSensitivity, .far)
 
         let restored = RuntimeSettingsModel(
             applicationSupportURL: root,
@@ -92,5 +94,6 @@ final class AppSurfaceModelsTests: XCTestCase {
             defaults: defaults
         )
         XCTAssertEqual(restored.retentionDays, 365)
+        XCTAssertEqual(restored.microphoneSensitivity, .far)
     }
 }

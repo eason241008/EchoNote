@@ -7,6 +7,7 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
     private let modelFolder: URL
     private let captionWorkspace: CaptionWorkspaceModel
     private let translationProvider: any SimplifiedChineseTranslationProviding
+    private let speechActivationDecibels: @MainActor () -> Float
 
     private var capture: AVFoundationLectureCaptureService?
     private var transcription: LiveTranscriptionPipeline?
@@ -22,13 +23,15 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         database: LectureDatabase,
         modelFolder: URL,
         captionWorkspace: CaptionWorkspaceModel,
-        translationProvider: any SimplifiedChineseTranslationProviding
+        translationProvider: any SimplifiedChineseTranslationProviding,
+        speechActivationDecibels: @escaping @MainActor () -> Float = { -38 }
     ) {
         self.storage = storage
         self.database = database
         self.modelFolder = modelFolder
         self.captionWorkspace = captionWorkspace
         self.translationProvider = translationProvider
+        self.speechActivationDecibels = speechActivationDecibels
     }
 
     public func prepare(_ preparation: LectureCapturePreparation) async throws {
@@ -51,7 +54,8 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         let transcription = LiveTranscriptionPipeline(
             sessionID: preparation.session.id,
             recognizer: recognizer,
-            repository: transcriptRepository
+            repository: transcriptRepository,
+            speechActivationDecibels: speechActivationDecibels()
         )
         let translation = makeTranslationPipeline()
         let capture = AVFoundationLectureCaptureService(storage: storage)

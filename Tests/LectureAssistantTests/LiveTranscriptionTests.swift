@@ -120,6 +120,35 @@ final class LiveTranscriptionTests: XCTestCase {
         XCTAssertEqual(counts.finalized, 0)
     }
 
+    func testFarSensitivityRecognizesQuietSpeechFilteredByStandardSensitivity() async throws {
+        let standard = try await makeFixture(
+            partials: ["quiet lecture"],
+            finalText: "quiet lecture",
+            speechActivationDecibels: MicrophoneSensitivity.standard.speechActivationDecibels
+        )
+        let standardCollector = collectSegments(from: standard.pipeline)
+        await standard.pipeline.consume(try frame(seconds: 1.12, decibels: -44))
+        await standard.pipeline.finish()
+        let standardSegments = await standardCollector.value
+        XCTAssertTrue(standardSegments.isEmpty)
+        let standardCounts = await standard.recognizer.counts()
+        XCTAssertEqual(standardCounts.consumed, 0)
+
+        let far = try await makeFixture(
+            partials: ["quiet lecture"],
+            finalText: "quiet lecture",
+            speechActivationDecibels: MicrophoneSensitivity.far.speechActivationDecibels
+        )
+        let farCollector = collectSegments(from: far.pipeline)
+        await far.pipeline.consume(try frame(seconds: 1.12, decibels: -44))
+        await far.pipeline.finish()
+        let finalized = await farCollector.value.filter { $0.isFinal && !$0.isGap }
+
+        XCTAssertEqual(finalized.map(\.text), ["quiet lecture"])
+        let farCounts = await far.recognizer.counts()
+        XCTAssertEqual(farCounts.consumed, 1)
+    }
+
     func testPauseForcesFinalWithoutWaitingForSilence() async throws {
         let fixture = try await makeFixture(partials: ["lecture"], finalText: "lecture complete")
         let collector = collectSegments(from: fixture.pipeline)
@@ -209,7 +238,8 @@ final class LiveTranscriptionTests: XCTestCase {
     private func makeFixture(
         partials: [String],
         finalText: String,
-        shouldFail: Bool = false
+        shouldFail: Bool = false,
+        speechActivationDecibels: Float = -38
     ) async throws -> (
         pipeline: LiveTranscriptionPipeline,
         recognizer: StubStreamingSpeechRecognizer,
@@ -237,7 +267,8 @@ final class LiveTranscriptionTests: XCTestCase {
             LiveTranscriptionPipeline(
                 sessionID: setup.1.id,
                 recognizer: recognizer,
-                repository: setup.0
+                repository: setup.0,
+                speechActivationDecibels: speechActivationDecibels
             ),
             recognizer,
             setup.0,

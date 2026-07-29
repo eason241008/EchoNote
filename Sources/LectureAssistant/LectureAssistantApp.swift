@@ -279,6 +279,7 @@ struct ContentView: View {
             RecordingPage(
                 model: model,
                 captionWorkspace: captionWorkspace,
+                runtimeSettings: runtimeSettings,
                 title: $title,
                 errorMessage: $errorMessage,
                 run: run
@@ -320,6 +321,7 @@ struct ContentView: View {
 private struct RecordingPage: View {
     @ObservedObject var model: ApplicationModel
     @ObservedObject var captionWorkspace: CaptionWorkspaceModel
+    @ObservedObject var runtimeSettings: RuntimeSettingsModel
     @Binding var title: String
     @Binding var errorMessage: String?
     let run: (@escaping () async throws -> Void) -> Void
@@ -365,6 +367,39 @@ private struct RecordingPage: View {
                             .frame(height: 44)
                             .background(AppPalette.elevated, in: RoundedRectangle(cornerRadius: 10))
                             .overlay(RoundedRectangle(cornerRadius: 10).stroke(AppPalette.border))
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("麦克风拾音距离")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Menu {
+                                ForEach(MicrophoneSensitivity.allCases) { sensitivity in
+                                    Button {
+                                        runtimeSettings.setMicrophoneSensitivity(sensitivity)
+                                    } label: {
+                                        if sensitivity == runtimeSettings.microphoneSensitivity {
+                                            Label(sensitivity.title, systemImage: "checkmark")
+                                        } else {
+                                            Text(sensitivity.title)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Label(
+                                    runtimeSettings.microphoneSensitivity.title,
+                                    systemImage: "mic.badge.plus"
+                                )
+                                .frame(minWidth: 108)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+
+                            Text(runtimeSettings.microphoneSensitivity.guidance)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
                     }
 
                     HStack(spacing: 12) {
