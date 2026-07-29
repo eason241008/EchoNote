@@ -9,12 +9,18 @@ private actor StubTranslationProvider: SimplifiedChineseTranslationProviding {
     private var error: Error?
     private(set) var requests: [SimplifiedChineseTranslationRequest] = []
 
-    init(error: Error? = nil) { self.error = error }
+    private let delay: Duration?
+
+    init(error: Error? = nil, delay: Duration? = nil) {
+        self.error = error
+        self.delay = delay
+    }
 
     func translate(
         _ request: SimplifiedChineseTranslationRequest
     ) async throws -> SimplifiedChineseTranslationResponse {
         requests.append(request)
+        if let delay { try await Task.sleep(for: delay) }
         if let error { throw error }
         return try SimplifiedChineseTranslationResponse(
             translations: request.segments.map {
@@ -98,6 +104,28 @@ final class TranslationPipelineTests: XCTestCase {
             ) { statement in String(cString: sqlite3_column_text(statement, 0)) }
         }
         XCTAssertEqual(Set(links), Set([first.rawValue.uuidString, second.rawValue.uuidString]))
+    }
+
+    func testFinishWaitsForInFlightTranslationBeforeClosingResults() async throws {
+        let provider = StubTranslationProvider(delay: .milliseconds(80))
+        let pipeline = TranslationPipeline(provider: provider, batchingDelay: .milliseconds(5))
+        let revisionID = TranscriptRevisionID()
+        let resultTask = Task { () -> SimplifiedChineseTranslation? in
+            for await result in pipeline.results { return result }
+            return nil
+        }
+
+        await pipeline.enqueue(.init(
+            sessionID: SessionID(),
+            revisionID: revisionID,
+            text: "Final lecture sentence"
+        ))
+        try await Task.sleep(for: .milliseconds(20))
+        await pipeline.finish()
+        let result = await resultTask.value
+
+        XCTAssertEqual(result?.revisionID, revisionID)
+        XCTAssertEqual(result?.text, "中文：Final lecture sentence")
     }
 
     func testRetryableFailureKeepsBatchForRetry() async throws {

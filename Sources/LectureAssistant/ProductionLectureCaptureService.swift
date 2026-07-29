@@ -67,6 +67,7 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         self.capture = capture
         self.transcription = transcription
         self.translation = translation
+        captionWorkspace.setTranslationAvailable(translation != nil)
         captionWorkspace.updateTranscriptionState("本地模型已就绪")
         captionWorkspace.updateTranslationState(translation == nil ? "仅英文" : "翻译已就绪")
 

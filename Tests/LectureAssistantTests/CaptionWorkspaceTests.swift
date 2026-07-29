@@ -75,6 +75,13 @@ final class CaptionWorkspaceTests: XCTestCase {
         XCTAssertEqual(model.segments.map(\.text), ["corrected", "keep"])
         XCTAssertTrue(model.segments[0].isFinal)
     }
+    func testTranslationPlaceholderReflectsProviderAvailability() {
+        let model = CaptionWorkspaceModel()
+        XCTAssertEqual(model.translationPlaceholder, "未配置中文翻译")
+        model.setTranslationAvailable(true)
+        XCTAssertEqual(model.translationPlaceholder, "等待翻译…")
+    }
+
     func testDisplaySettingsPersistAcrossWorkspaceModels() {
         let suiteName = "caption-settings-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

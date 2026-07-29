@@ -216,7 +216,7 @@ public actor TranslationPipeline {
     public init(
         provider: (any SimplifiedChineseTranslationProviding)?,
         repository: SQLiteTranslationRepository? = nil,
-        batchingDelay: Duration = .seconds(2),
+        batchingDelay: Duration = .milliseconds(500),
         capacity: Int = 64
     ) {
         self.provider = provider
@@ -244,28 +244,43 @@ public actor TranslationPipeline {
         if pending.count == capacity { pending.removeFirst() }
         pending.append(revision)
         stateStream.yield(.queued(pending.count))
-        guard flushTask == nil else { return }
-        flushTask = Task { [batchingDelay] in
-            try? await Task.sleep(for: batchingDelay)
-            await self.flush()
-        }
+        scheduleFlushIfNeeded()
     }
 
     public func retry() async {
-        await flush()
+        await flushNow()
     }
 
     public func finish() async {
-        flushTask?.cancel()
-        flushTask = nil
-        await flush()
+        if let flushTask {
+            await flushTask.value
+        }
+        while !pending.isEmpty {
+            guard await flushNow() else { break }
+        }
         resultStream.finish()
         stateStream.finish()
     }
 
-    private func flush() async {
+    private func scheduleFlushIfNeeded() {
+        guard flushTask == nil, !pending.isEmpty else { return }
+        flushTask = Task { [batchingDelay] in
+            try? await Task.sleep(for: batchingDelay)
+            await self.flushScheduledBatch()
+        }
+    }
+
+    private func flushScheduledBatch() async {
+        let succeeded = await flushNow()
         flushTask = nil
-        guard let provider, !pending.isEmpty else { return }
+        if succeeded {
+            scheduleFlushIfNeeded()
+        }
+    }
+
+    @discardableResult
+    private func flushNow() async -> Bool {
+        guard let provider, !pending.isEmpty else { return true }
         let batch = pending
         pending.removeAll(keepingCapacity: true)
         stateStream.yield(.translating(batch.count))
@@ -292,10 +307,12 @@ public actor TranslationPipeline {
                 resultStream.yield(translation)
             }
             stateStream.yield(.translated(response.translations.map(\.revisionID)))
+            return true
         } catch {
             pending.insert(contentsOf: batch, at: 0)
             let retryable = (error as? TranslationProviderError)?.isRetryable ?? false
             stateStream.yield(.failed(retryable: retryable, message: error.localizedDescription))
+            return false
         }
     }
 }

@@ -26,6 +26,7 @@ public final class CaptionWorkspaceModel: ObservableObject {
     @Published public var settings: CaptionDisplaySettings {
         didSet { persistSettings() }
     }
+    @Published public private(set) var translationAvailable = false
     private let defaults: UserDefaults
     private let settingsKey = "lecture-assistant.caption-display"
     private let settingsMigrationKey = "lecture-assistant.caption-display-v2"
@@ -63,6 +64,13 @@ public final class CaptionWorkspaceModel: ObservableObject {
         } else {
             segments.append(segment)
         }
+    }
+    public var translationPlaceholder: String {
+        translationAvailable ? "等待翻译…" : "未配置中文翻译"
+    }
+
+    public func setTranslationAvailable(_ available: Bool) {
+        translationAvailable = available
     }
 
     public func setTranslation(_ text: String, for revisionID: TranscriptRevisionID) {
@@ -166,6 +174,14 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
         window?.orderFrontRegardless()
     }
 
+    func snapshotPNG() -> Data? {
+        guard let contentView = window?.contentView,
+              let bitmap = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds)
+        else { return nil }
+        contentView.cacheDisplay(in: contentView.bounds, to: bitmap)
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
     public func hide() {
         model.quickHide()
         window?.orderOut(nil)
@@ -198,7 +214,7 @@ private struct CaptionOverlayView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            ForEach(model.segments.suffix(2), id: \.id) { segment in
+            ForEach(model.segments.suffix(1), id: \.id) { segment in
                 CaptionSegmentText(model: model, segment: segment)
             }
             if model.segments.isEmpty {
@@ -207,6 +223,8 @@ private struct CaptionOverlayView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .multilineTextAlignment(.leading)
         .padding(.horizontal, 26)
         .padding(.vertical, 22)
         .opacity(model.settings.opacity)
@@ -229,16 +247,20 @@ struct CaptionSegmentText: View {
                 if model.settings.languageVisibility != .simplifiedChineseOnly {
                     Text(segment.text)
                         .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(.leading)
                 }
                 if model.settings.languageVisibility != .englishOnly {
-                    Text(model.translation(for: segment) ?? "等待翻译…")
+                    Text(model.translation(for: segment) ?? model.translationPlaceholder)
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(.leading)
                 }
             }
             .font(.system(size: model.settings.textSize))
             .foregroundStyle(.white)
-            .lineLimit(3)
-            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(4)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

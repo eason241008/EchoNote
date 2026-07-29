@@ -4,7 +4,12 @@ import XCTest
 @testable import LectureAssistant
 
 private actor StubSpeechRecognizer: LocalSpeechRecognizing {
-    enum Behavior { case output(String), failure }
+    enum Behavior {
+        case output(String)
+        case outputs([SpeechRecognitionOutput])
+        case empty
+        case failure
+    }
     var behavior: Behavior
     private(set) var prompts: [String?] = []
 
@@ -19,6 +24,10 @@ private actor StubSpeechRecognizer: LocalSpeechRecognizing {
                 start: 0,
                 end: Double(samples.count) / 16_000
             )]
+        case let .outputs(outputs):
+            return outputs
+        case .empty:
+            return []
         case .failure:
             throw NSError(domain: "StubSpeechRecognizer", code: 1)
         }
@@ -75,6 +84,45 @@ final class LiveTranscriptionTests: XCTestCase {
         let acceptedPrompt = await fixture.recognizer.latestPrompt()
         XCTAssertEqual(acceptedPrompt, "machine learning")
         await fixture.pipeline.finish()
+    }
+
+    func testEmptyRecognitionIsTreatedAsSilenceInsteadOfMissingAudio() async throws {
+        let fixture = try await makeFixture(behavior: .empty)
+        let collector = Task { () -> [LiveTranscriptSegment] in
+            var values: [LiveTranscriptSegment] = []
+            for await segment in fixture.pipeline.segments { values.append(segment) }
+            return values
+        }
+
+        await fixture.pipeline.consume(try frame(samples: 32_000))
+        await fixture.pipeline.finish()
+
+        let segments = await collector.value
+        XCTAssertTrue(segments.isEmpty)
+    }
+
+    func testOutputsWithinOneWindowAreMergedAcrossShortPauses() async throws {
+        let outputs = [
+            SpeechRecognitionOutput(text: "This is a clause", start: 0, end: 1.4),
+            SpeechRecognitionOutput(text: "that continues after a pause.", start: 1.8, end: 3.2),
+        ]
+        let fixture = try await makeFixture(behavior: .outputs(outputs))
+        let collector = Task { () -> [LiveTranscriptSegment] in
+            var values: [LiveTranscriptSegment] = []
+            for await segment in fixture.pipeline.segments where segment.isFinal {
+                values.append(segment)
+            }
+            return values
+        }
+
+        await fixture.pipeline.consume(try frame(samples: 32_000))
+        await fixture.pipeline.finish()
+        let finalized = await collector.value
+
+        XCTAssertEqual(finalized.count, 1)
+        XCTAssertEqual(finalized[0].text, "This is a clause that continues after a pause.")
+        XCTAssertEqual(finalized[0].start, 0)
+        XCTAssertEqual(finalized[0].end, 3.2)
     }
 
     func testRecognitionFailureCreatesExplicitGapRevision() async throws {

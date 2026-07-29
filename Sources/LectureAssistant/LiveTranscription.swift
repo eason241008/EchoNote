@@ -104,7 +104,7 @@ public actor LiveTranscriptionPipeline {
         sessionID: SessionID,
         recognizer: any LocalSpeechRecognizing,
         repository: SQLiteTranscriptRevisionRepository? = nil,
-        finalWindowSeconds: Double = 5,
+        finalWindowSeconds: Double = 10,
         partialWindowSeconds: Double = 1,
         outputBufferLimit: Int = 32,
         latencyTracker: CaptionLatencyTracker = CaptionLatencyTracker()
@@ -177,47 +177,55 @@ public actor LiveTranscriptionPipeline {
         let windowStart = Double(consumedSamples) / Double(sampleRate)
         do {
             let outputs = try await recognizer.transcribe(samples: samples, prompt: prompt)
-            if outputs.isEmpty && final {
-                await emitGap(sampleCount: samples.count, reason: "No trustworthy transcription")
+            guard let output = Self.mergedOutput(outputs) else {
+                if final { consumedSamples += samples.count }
                 return
             }
-            for output in outputs {
-                let segmentID = "segment-\(segmentIndex)"
-                let revision: TranscriptRevision?
-                if final, let repository {
-                    revision = try? await repository.createRevision(
-                        sessionID: sessionID,
-                        segmentID: segmentID,
-                        startsAt: windowStart + output.start,
-                        endsAt: windowStart + output.end,
-                        text: output.text,
-                        status: .finalized
-                    )
-                } else {
-                    revision = nil
-                }
-                let segment = LiveTranscriptSegment(
-                    id: segmentID,
+            let segmentID = "segment-\(segmentIndex)"
+            let revision: TranscriptRevision?
+            if final, let repository {
+                revision = try? await repository.createRevision(
                     sessionID: sessionID,
-                    start: windowStart + output.start,
-                    end: windowStart + output.end,
+                    segmentID: segmentID,
+                    startsAt: windowStart + output.start,
+                    endsAt: windowStart + output.end,
                     text: output.text,
-                    isFinal: final,
-                    revisionID: revision?.id
+                    status: .finalized
                 )
-                outputStream.yield(segment)
-                if final { segmentIndex += 1 }
+            } else {
+                revision = nil
             }
-            if !outputs.isEmpty {
-                let latency = await latencyTracker.record(windowCompletedAt: windowCompletedAt)
-                latencyStream.yield(latency)
-            }
+            let segment = LiveTranscriptSegment(
+                id: segmentID,
+                sessionID: sessionID,
+                start: windowStart + output.start,
+                end: windowStart + output.end,
+                text: output.text,
+                isFinal: final,
+                revisionID: revision?.id
+            )
+            outputStream.yield(segment)
+            if final { segmentIndex += 1 }
+            let latency = await latencyTracker.record(windowCompletedAt: windowCompletedAt)
+            latencyStream.yield(latency)
             if final { consumedSamples += samples.count }
         } catch {
             if final {
                 await emitGap(sampleCount: samples.count, reason: error.localizedDescription)
             }
         }
+    }
+
+    static func mergedOutput(_ outputs: [SpeechRecognitionOutput]) -> SpeechRecognitionOutput? {
+        let usable = outputs.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard let first = usable.first, let last = usable.last else { return nil }
+        let text = usable.map(\.text)
+            .joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return SpeechRecognitionOutput(text: text, start: first.start, end: last.end)
     }
 
     private func emitGap(sampleCount: Int, reason: String) async {
