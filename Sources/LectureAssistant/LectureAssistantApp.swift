@@ -229,8 +229,7 @@ struct ContentView: View {
                                 Spacer()
                             }
                             .foregroundStyle(selection == section ? AppPalette.primary : .secondary)
-                            .padding(.horizontal, 14)
-                            .frame(height: 44)
+                            .contentShape(Rectangle())
                             .background(
                                 RoundedRectangle(cornerRadius: 12)
                                     .fill(
@@ -239,6 +238,7 @@ struct ContentView: View {
                                             : .clear
                                     )
                             )
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(section.title)
@@ -352,6 +352,42 @@ private struct RecordingPage: View {
             }
 
             SoftCard {
+                HStack(spacing: 16) {
+                    Image(systemName: "mic.badge.plus")
+                        .font(.title2)
+                        .foregroundStyle(AppPalette.sage)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("麦克风拾音距离")
+                            .font(.headline)
+                        Text(runtimeSettings.microphoneSensitivity.guidance)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Menu {
+                        ForEach(MicrophoneSensitivity.allCases) { sensitivity in
+                            Button {
+                                runtimeSettings.setMicrophoneSensitivity(sensitivity)
+                            } label: {
+                                if sensitivity == runtimeSettings.microphoneSensitivity {
+                                    Label(sensitivity.title, systemImage: "checkmark")
+                                } else {
+                                    Text(sensitivity.title)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(
+                            runtimeSettings.microphoneSensitivity.title,
+                            systemImage: "chevron.up.chevron.down"
+                        )
+                        .frame(minWidth: 108)
+                    }
+                    .buttonStyle(SecondaryActionButtonStyle())
+                }
+            }
+
+            SoftCard {
                 VStack(alignment: .leading, spacing: 18) {
                     Label("新建课堂记录", systemImage: "plus.circle.fill")
                         .font(.system(size: 18, weight: .semibold))
@@ -369,38 +405,7 @@ private struct RecordingPage: View {
                             .overlay(RoundedRectangle(cornerRadius: 10).stroke(AppPalette.border))
                     }
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("麦克风拾音距离")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 12) {
-                            Menu {
-                                ForEach(MicrophoneSensitivity.allCases) { sensitivity in
-                                    Button {
-                                        runtimeSettings.setMicrophoneSensitivity(sensitivity)
-                                    } label: {
-                                        if sensitivity == runtimeSettings.microphoneSensitivity {
-                                            Label(sensitivity.title, systemImage: "checkmark")
-                                        } else {
-                                            Text(sensitivity.title)
-                                        }
-                                    }
-                                }
-                            } label: {
-                                Label(
-                                    runtimeSettings.microphoneSensitivity.title,
-                                    systemImage: "mic.badge.plus"
-                                )
-                                .frame(minWidth: 108)
-                            }
-                            .menuStyle(.borderlessButton)
-                            .fixedSize()
 
-                            Text(runtimeSettings.microphoneSensitivity.guidance)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
 
                     HStack(spacing: 12) {
                         Button {
@@ -788,6 +793,7 @@ private struct LibraryPage: View {
                                     Spacer()
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
@@ -833,6 +839,7 @@ private struct LibraryPage: View {
                                             : Color.clear,
                                         in: RoundedRectangle(cornerRadius: 10)
                                     )
+                                    .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -1189,6 +1196,7 @@ private struct InteractiveButtonBody: View {
             .foregroundStyle(foreground)
             .padding(.horizontal, 16)
             .frame(height: 38)
+            .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 10)
                     .fill(background.opacity(configuration.isPressed ? 0.72 : isHovered ? 0.9 : 1))
