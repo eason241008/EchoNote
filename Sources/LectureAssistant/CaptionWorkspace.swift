@@ -213,24 +213,50 @@ private struct CaptionOverlayView: View {
     @ObservedObject var model: CaptionWorkspaceModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            ForEach(model.segments.suffix(1), id: \.id) { segment in
-                CaptionSegmentText(model: model, segment: segment)
+        ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(model.segments, id: \.id) { segment in
+                        CaptionSegmentText(model: model, segment: segment)
+                            .id(segment.id)
+                    }
+                    if model.segments.isEmpty {
+                        Text("等待字幕…")
+                            .font(.system(size: model.settings.textSize))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 26)
+                .padding(.vertical, 22)
             }
-            if model.segments.isEmpty {
-                Text("等待字幕…")
-                    .font(.system(size: model.settings.textSize))
-                    .foregroundStyle(.secondary)
+            .onAppear {
+                guard let id = model.segments.last?.id else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(id, anchor: .bottom)
+                }
+            }
+            .onChange(of: scrollTarget) {
+                guard let id = model.segments.last?.id else { return }
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(id, anchor: .bottom)
+                }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .multilineTextAlignment(.leading)
-        .padding(.horizontal, 26)
-        .padding(.vertical, 22)
         .opacity(model.settings.opacity)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("课堂实时双语字幕")
         .accessibilityValue(model.segments.last?.text ?? "暂无字幕")
+    }
+
+    private var scrollTarget: String {
+        guard let segment = model.segments.last else { return "" }
+        return [
+            segment.id,
+            segment.text,
+            model.translation(for: segment) ?? "",
+        ].joined(separator: "\u{1f}")
     }
 }
 
@@ -248,18 +274,19 @@ struct CaptionSegmentText: View {
                     Text(segment.text)
                         .fontWeight(.semibold)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
                         .multilineTextAlignment(.leading)
                 }
                 if model.settings.languageVisibility != .englishOnly {
                     Text(model.translation(for: segment) ?? model.translationPlaceholder)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
                         .multilineTextAlignment(.leading)
                 }
             }
             .font(.system(size: model.settings.textSize))
             .foregroundStyle(.white)
-            .lineLimit(4)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

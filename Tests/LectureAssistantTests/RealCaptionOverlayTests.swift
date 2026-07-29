@@ -14,7 +14,7 @@ final class RealCaptionOverlayTests: XCTestCase {
             sessionID: SessionID(),
             start: 0,
             end: 1,
-            text: "Visible caption",
+            text: "The first finalized lecture segment remains available above the current sentence instead of being discarded when another segment begins.",
             isFinal: true
         ))
         let revisionID = TranscriptRevisionID()
@@ -23,12 +23,26 @@ final class RealCaptionOverlayTests: XCTestCase {
             sessionID: SessionID(),
             start: 1,
             end: 4,
-            text: "A longer English caption should begin at the left padding and wrap naturally.",
+            text: "The second English caption is deliberately long enough to wrap across several visual lines without using an ellipsis or a fixed line limit, so every word remains readable while the lecturer continues explaining the topic in detail.",
             isFinal: true,
             revisionID: revisionID
         ))
         model.setTranslationAvailable(true)
-        model.setTranslation("较长的中文字幕应从左侧内边距开始，并自然换行。", for: revisionID)
+        model.setTranslation("第二段中文字幕也应完整保留并自然换行，不得因为固定行数限制而显示省略号。", for: revisionID)
+        let latestRevisionID = TranscriptRevisionID()
+        model.append(LiveTranscriptSegment(
+            id: "segment-2",
+            sessionID: SessionID(),
+            start: 4,
+            end: 9,
+            text: "The newest caption continues downward inside a scrollable history, automatically follows partial text growth, and keeps the complete English sentence visible even when it becomes much longer than the floating panel height.",
+            isFinal: true,
+            revisionID: latestRevisionID
+        ))
+        model.setTranslation(
+            "最新的中文字幕会继续向下排列，浮动窗口自动跟随到最下方，同时历史段落仍可向上滚动查看。",
+            for: latestRevisionID
+        )
         let controller = CaptionOverlayWindowController(model: model)
 
         controller.show()
@@ -49,8 +63,9 @@ final class RealCaptionOverlayTests: XCTestCase {
         XCTAssertEqual(
             model.segments.map(\.text),
             [
-                "Visible caption",
-                "A longer English caption should begin at the left padding and wrap naturally.",
+                "The first finalized lecture segment remains available above the current sentence instead of being discarded when another segment begins.",
+                "The second English caption is deliberately long enough to wrap across several visual lines without using an ellipsis or a fixed line limit, so every word remains readable while the lecturer continues explaining the topic in detail.",
+                "The newest caption continues downward inside a scrollable history, automatically follows partial text growth, and keeps the complete English sentence visible even when it becomes much longer than the floating panel height.",
             ]
         )
         XCTAssertTrue(model.settings.isHidden)

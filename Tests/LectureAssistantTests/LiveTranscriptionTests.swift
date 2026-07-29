@@ -63,6 +63,29 @@ final class LiveTranscriptionTests: XCTestCase {
         XCTAssertEqual(counts.finalized, 1)
     }
 
+    func testClassroomNoiseAfterSpeechFinalizesAndCreatesTranslatableRevision() async throws {
+        let fixture = try await makeFixture(
+            partials: ["a complete lecture sentence", "a complete lecture sentence"],
+            finalText: "a complete lecture sentence"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
+
+        await fixture.pipeline.consume(try frame(seconds: 1.12, decibels: -16))
+        await fixture.pipeline.consume(try frame(seconds: 0.6, decibels: -42))
+        await fixture.pipeline.consume(try frame(seconds: 0.6, decibels: -42))
+        let countsBeforeStop = await fixture.recognizer.counts()
+        XCTAssertEqual(countsBeforeStop.finalized, 1)
+        let storedBeforeStop = try await MainActor.run {
+            try fixture.repository.history(sessionID: fixture.session.id, segmentID: "segment-0")
+        }
+        XCTAssertEqual(storedBeforeStop.map(\.text), ["a complete lecture sentence"])
+
+        await fixture.pipeline.finish()
+        let segments = await collector.value
+        let finalized = try XCTUnwrap(segments.first { $0.isFinal && !$0.isGap })
+        XCTAssertNotNil(finalized.revisionID)
+    }
+
     func testSilenceBoundaryFinalizesUtteranceAndStartsNextSegment() async throws {
         let fixture = try await makeFixture(
             partials: ["first", "first", "first", "second"],

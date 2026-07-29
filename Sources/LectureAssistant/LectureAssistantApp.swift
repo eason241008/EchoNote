@@ -459,7 +459,7 @@ private struct RecordingPage: View {
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 12)
                     } else {
-                        ForEach(captionWorkspace.segments.suffix(3), id: \.id) { segment in
+                        ForEach(captionWorkspace.segments, id: \.id) { segment in
                             CaptionSegmentText(model: captionWorkspace, segment: segment)
                                 .font(.body)
                                 .padding(.vertical, 4)

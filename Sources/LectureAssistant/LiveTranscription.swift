@@ -68,11 +68,13 @@ public actor LiveTranscriptionPipeline {
     private let sessionID: SessionID
     private let recognizer: any StreamingSpeechRecognizing
     private let repository: SQLiteTranscriptRevisionRepository?
-    private let silenceThresholdDecibels: Float
+    private let speechActivationDecibels: Float
+    private let relativeSilenceDropDecibels: Float
     private let finalSilenceSeconds: TimeInterval
     private var timelineSeconds: TimeInterval = 0
     private var utteranceStart: TimeInterval?
     private var silenceSeconds: TimeInterval = 0
+    private var utterancePeakDecibels: Float?
     private var segmentIndex = 0
     private var lastPartial = ""
     private var lastCapturedAt: ContinuousClock.Instant?
@@ -87,7 +89,8 @@ public actor LiveTranscriptionPipeline {
         sessionID: SessionID,
         recognizer: any StreamingSpeechRecognizing,
         repository: SQLiteTranscriptRevisionRepository? = nil,
-        silenceThresholdDecibels: Float = -50,
+        speechActivationDecibels: Float = -38,
+        relativeSilenceDropDecibels: Float = 18,
         finalSilenceSeconds: TimeInterval = 1.2,
         outputBufferLimit: Int = 32,
         latencyTracker: CaptionLatencyTracker = CaptionLatencyTracker()
@@ -95,7 +98,8 @@ public actor LiveTranscriptionPipeline {
         self.sessionID = sessionID
         self.recognizer = recognizer
         self.repository = repository
-        self.silenceThresholdDecibels = silenceThresholdDecibels
+        self.speechActivationDecibels = speechActivationDecibels
+        self.relativeSilenceDropDecibels = relativeSilenceDropDecibels
         self.finalSilenceSeconds = finalSilenceSeconds
         self.latencyTracker = latencyTracker
         let outputStream = BoundedAsyncStream<LiveTranscriptSegment>(limit: outputBufferLimit)
@@ -112,11 +116,22 @@ public actor LiveTranscriptionPipeline {
         let frameStart = timelineSeconds
         timelineSeconds += duration
         lastCapturedAt = frame.capturedAt
-        let containsSpeech = frame.activity.decibels > silenceThresholdDecibels
+        let containsSpeech: Bool
+        if let utterancePeakDecibels {
+            let adaptiveBoundary = max(
+                speechActivationDecibels,
+                utterancePeakDecibels - relativeSilenceDropDecibels
+            )
+            containsSpeech = frame.activity.decibels > adaptiveBoundary
+            self.utterancePeakDecibels = max(utterancePeakDecibels, frame.activity.decibels)
+        } else {
+            containsSpeech = frame.activity.decibels > speechActivationDecibels
+        }
 
         guard utteranceStart != nil || containsSpeech else { return }
         if utteranceStart == nil {
             utteranceStart = frameStart
+            utterancePeakDecibels = frame.activity.decibels
             silenceSeconds = 0
         }
         silenceSeconds = containsSpeech ? 0 : silenceSeconds + duration
@@ -231,6 +246,7 @@ public actor LiveTranscriptionPipeline {
     private func resetUtterance() {
         utteranceStart = nil
         silenceSeconds = 0
+        utterancePeakDecibels = nil
         lastPartial = ""
     }
 
