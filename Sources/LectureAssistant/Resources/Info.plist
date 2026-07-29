@@ -8,6 +8,8 @@
     <string>com.eason241008.echonote</string>
     <key>CFBundleName</key>
     <string>EchoNote</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>

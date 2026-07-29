@@ -28,6 +28,10 @@ try fileManager.copyItem(
     at: root.appendingPathComponent("Sources/LectureAssistant/Resources/Info.plist"),
     to: contentsURL.appendingPathComponent("Info.plist")
 )
+try fileManager.copyItem(
+    at: root.appendingPathComponent("Sources/LectureAssistant/Resources/AppIcon.icns"),
+    to: resourcesURL.appendingPathComponent("AppIcon.icns")
+)
 try run("/usr/bin/codesign", [
     "--force", "--deep", "--sign", "-",
     "--entitlements", root.appendingPathComponent("LectureAssistant.entitlements").path,

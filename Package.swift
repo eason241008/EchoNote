@@ -20,7 +20,7 @@ let package = Package(
                 .product(name: "WhisperKit", package: "argmax-oss-swift"),
             ],
             path: "Sources/LectureAssistant",
-            exclude: ["Resources/Info.plist"]
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "LectureAssistantTests",
