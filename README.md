@@ -126,7 +126,7 @@ The production pipeline uses English-only `Nemotron Streaming 0.6B`:
 - Estimated download: approximately 600 MB.
 - Streaming tier: 1120 ms chunks with recurrent encoder state.
 - Inference: local Core ML through FluidAudio on the Apple Neural Engine.
-- Utterance boundary: 1.2 seconds of silence, pause, or stop.
+- Utterance boundary: 0.65 seconds of silence, pause, or stop.
 - Model storage: `~/Library/Application Support/EchoNote/Models/nemotron-streaming/1120ms/`.
 - Recording is blocked until model validation succeeds.
 

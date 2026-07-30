@@ -106,6 +106,24 @@ final class LiveTranscriptionTests: XCTestCase {
         XCTAssertLessThan(finalized[0].end, finalized[1].end)
     }
 
+    func testNaturalPauseFinalizesBeforeNextSentence() async throws {
+        let fixture = try await makeFixture(
+            partials: ["first sentence", "first sentence", "second sentence"],
+            finalText: "first sentence"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
+
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        await fixture.pipeline.consume(try frame(seconds: 0.8, decibels: -70))
+        let countsBeforeNextSentence = await fixture.recognizer.counts()
+        XCTAssertEqual(countsBeforeNextSentence.finalized, 1)
+
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        await fixture.pipeline.finish()
+        let finalized = await collector.value.filter { $0.isFinal && !$0.isGap }
+        XCTAssertEqual(finalized.count, 2)
+    }
+
     func testLeadingSilenceDoesNotReachRecognizerOrCreateSegments() async throws {
         let fixture = try await makeFixture(partials: [], finalText: "")
         let collector = collectSegments(from: fixture.pipeline)
