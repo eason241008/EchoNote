@@ -124,6 +124,63 @@ final class LiveTranscriptionTests: XCTestCase {
         XCTAssertEqual(finalized.count, 2)
     }
 
+    func testTwoCompletedSentencesFinalizeWithoutSilence() async throws {
+        let fixture = try await makeFixture(
+            partials: [
+                "First sentence.",
+                "First sentence. Second sentence.",
+                "Third sentence.",
+            ],
+            finalText: "First sentence. Second sentence."
+        )
+        let collector = collectSegments(from: fixture.pipeline)
+
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        let countsAfterTwoSentences = await fixture.recognizer.counts()
+        XCTAssertEqual(countsAfterTwoSentences.finalized, 1)
+
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        await fixture.pipeline.finish()
+        let finalized = await collector.value.filter { $0.isFinal && !$0.isGap }
+        XCTAssertEqual(finalized.count, 2)
+    }
+
+    func testAbbreviationsAndDecimalsDoNotTriggerSentenceLimit() async throws {
+        let fixture = try await makeFixture(
+            partials: [
+                "Dr. Smith explains version 2.5.",
+                "Dr. Smith explains version 2.5 carefully",
+            ],
+            finalText: "Dr. Smith explains version 2.5 carefully"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
+
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
+        let countsBeforeFinish = await fixture.recognizer.counts()
+        XCTAssertEqual(countsBeforeFinish.finalized, 0)
+
+        await fixture.pipeline.finish()
+        _ = await collector.value
+    }
+
+    func testMaximumDurationFinalizesSpeechWithoutPunctuation() async throws {
+        let fixture = try await makeFixture(
+            partials: ["continuous lecture speech"],
+            finalText: "continuous lecture speech"
+        )
+        let collector = collectSegments(from: fixture.pipeline)
+
+        await fixture.pipeline.consume(try frame(seconds: 15, decibels: -12))
+        let countsAtDurationLimit = await fixture.recognizer.counts()
+        XCTAssertEqual(countsAtDurationLimit.finalized, 1)
+
+        await fixture.pipeline.finish()
+        let finalized = await collector.value.filter { $0.isFinal && !$0.isGap }
+        XCTAssertEqual(finalized.count, 1)
+    }
+
     func testLeadingSilenceDoesNotReachRecognizerOrCreateSegments() async throws {
         let fixture = try await makeFixture(partials: [], finalText: "")
         let collector = collectSegments(from: fixture.pipeline)

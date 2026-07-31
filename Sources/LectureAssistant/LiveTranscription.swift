@@ -71,6 +71,8 @@ public actor LiveTranscriptionPipeline {
     private let speechActivationDecibels: Float
     private let relativeSilenceDropDecibels: Float
     private let finalSilenceSeconds: TimeInterval
+    private let maximumSentencesPerSegment: Int
+    private let maximumSegmentSeconds: TimeInterval
     private var timelineSeconds: TimeInterval = 0
     private var utteranceStart: TimeInterval?
     private var silenceSeconds: TimeInterval = 0
@@ -92,6 +94,8 @@ public actor LiveTranscriptionPipeline {
         speechActivationDecibels: Float = -38,
         relativeSilenceDropDecibels: Float = 18,
         finalSilenceSeconds: TimeInterval = 0.45,
+        maximumSentencesPerSegment: Int = 2,
+        maximumSegmentSeconds: TimeInterval = 15,
         outputBufferLimit: Int = 32,
         latencyTracker: CaptionLatencyTracker = CaptionLatencyTracker()
     ) {
@@ -101,6 +105,8 @@ public actor LiveTranscriptionPipeline {
         self.speechActivationDecibels = speechActivationDecibels
         self.relativeSilenceDropDecibels = relativeSilenceDropDecibels
         self.finalSilenceSeconds = finalSilenceSeconds
+        self.maximumSentencesPerSegment = maximumSentencesPerSegment
+        self.maximumSegmentSeconds = maximumSegmentSeconds
         self.latencyTracker = latencyTracker
         let outputStream = BoundedAsyncStream<LiveTranscriptSegment>(limit: outputBufferLimit)
         self.outputStream = outputStream
@@ -142,7 +148,10 @@ public actor LiveTranscriptionPipeline {
                 lastPartial = partial
                 await emit(text: partial, final: false, completedAt: frame.capturedAt)
             }
-            if silenceSeconds >= finalSilenceSeconds {
+            let segmentDuration = timelineSeconds - (utteranceStart ?? timelineSeconds)
+            if completedSentenceCount(in: partial) >= maximumSentencesPerSegment
+                || segmentDuration >= maximumSegmentSeconds
+                || silenceSeconds >= finalSilenceSeconds {
                 await finalizeUtterance(completedAt: frame.capturedAt)
             }
         } catch {
@@ -258,6 +267,46 @@ public actor LiveTranscriptionPipeline {
     private func frameDuration(_ buffer: AVAudioPCMBuffer) -> TimeInterval {
         guard buffer.format.sampleRate > 0 else { return 0 }
         return Double(buffer.frameLength) / buffer.format.sampleRate
+    }
+
+    private func completedSentenceCount(in text: String) -> Int {
+        let characters = Array(text)
+        var count = 0
+        var index = 0
+
+        while index < characters.count {
+            let character = characters[index]
+            if "?!。！？".contains(character) {
+                count += 1
+                repeat { index += 1 } while index < characters.count && "?!。！？".contains(characters[index])
+                continue
+            }
+
+            if character == ".", isSentencePeriod(at: index, in: characters) {
+                count += 1
+            }
+            index += 1
+        }
+        return count
+    }
+
+    private func isSentencePeriod(at index: Int, in characters: [Character]) -> Bool {
+        let previous = index > 0 ? characters[index - 1] : nil
+        let next = index + 1 < characters.count ? characters[index + 1] : nil
+        if previous?.isNumber == true, next?.isNumber == true { return false }
+        if previous == "." || next == "." { return false }
+
+        var wordStart = index
+        while wordStart > 0, characters[wordStart - 1].isLetter {
+            wordStart -= 1
+        }
+        let word = String(characters[wordStart..<index]).lowercased()
+        let abbreviations: Set<String> = [
+            "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st",
+            "vs", "etc", "fig", "eq", "no",
+        ]
+        if abbreviations.contains(word) || word.count == 1 { return false }
+        return true
     }
 
     private func normalized(_ text: String) -> String {
