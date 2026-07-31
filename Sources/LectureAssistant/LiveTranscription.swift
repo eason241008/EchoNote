@@ -91,7 +91,7 @@ public actor LiveTranscriptionPipeline {
         repository: SQLiteTranscriptRevisionRepository? = nil,
         speechActivationDecibels: Float = -38,
         relativeSilenceDropDecibels: Float = 18,
-        finalSilenceSeconds: TimeInterval = 0.65,
+        finalSilenceSeconds: TimeInterval = 0.45,
         outputBufferLimit: Int = 32,
         latencyTracker: CaptionLatencyTracker = CaptionLatencyTracker()
     ) {

@@ -114,7 +114,7 @@ final class LiveTranscriptionTests: XCTestCase {
         let collector = collectSegments(from: fixture.pipeline)
 
         await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -12))
-        await fixture.pipeline.consume(try frame(seconds: 0.8, decibels: -70))
+        await fixture.pipeline.consume(try frame(seconds: 0.5, decibels: -70))
         let countsBeforeNextSentence = await fixture.recognizer.counts()
         XCTAssertEqual(countsBeforeNextSentence.finalized, 1)
 
