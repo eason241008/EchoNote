@@ -7,6 +7,8 @@ public final class ApplicationModel: ObservableObject {
     @Published public private(set) var restoredSession: LectureSession?
     @Published public private(set) var capturePreflight: CapturePreflightResult?
     @Published public private(set) var recordingIndicator: RecordingIndicatorSnapshot
+    @Published public private(set) var automaticStopAt: Date?
+    @Published public private(set) var automaticStopFailureMessage: String?
 
     private let services: ApplicationServices
     private let defaults: UserDefaults
@@ -17,6 +19,8 @@ public final class ApplicationModel: ObservableObject {
     private let preflightService: CapturePreflightService?
     private let storageRootURL: URL?
     private let transcriptionModelReady: @MainActor @Sendable () -> Bool
+    private let automaticStopGracePeriod: TimeInterval
+    private var automaticStopTask: Task<Void, Never>?
 
     public init(
         services: ApplicationServices = .unavailable,
@@ -26,6 +30,7 @@ public final class ApplicationModel: ObservableObject {
         indicatorStore: RecordingIndicatorStore? = nil,
         preflightService: CapturePreflightService? = nil,
         storageRootURL: URL? = nil,
+        automaticStopGracePeriod: TimeInterval = 5 * 60,
         transcriptionModelReady: @escaping @MainActor @Sendable () -> Bool = { false }
     ) {
         self.services = services
@@ -35,15 +40,36 @@ public final class ApplicationModel: ObservableObject {
         self.indicatorStore = indicatorStore ?? RecordingIndicatorStore(defaults: defaults)
         self.preflightService = preflightService
         self.storageRootURL = storageRootURL
+        self.automaticStopGracePeriod = automaticStopGracePeriod
         self.transcriptionModelReady = transcriptionModelReady
         recordingIndicator = self.indicatorStore.snapshot
         restoreSession()
     }
 
-    public func prepareSession(title: String, courseID: CourseID? = nil) {
-        let session = LectureSession(courseID: courseID, title: title)
+    public func prepareSession(
+        title: String,
+        courseID: CourseID? = nil,
+        scheduledEventID: String? = nil,
+        scheduledEndAt: Date? = nil
+    ) {
+        cancelAutomaticStop()
+        let session = LectureSession(
+            courseID: courseID,
+            title: title,
+            scheduledEventID: scheduledEventID,
+            scheduledEndAt: scheduledEndAt.map(LectureTimestamp.init)
+        )
         activeSession = session
         persist(session)
+    }
+
+    public func prepareSession(for context: TimetableRecordingContext) {
+        let event = context.event
+        prepareSession(
+            title: context.title,
+            scheduledEventID: "\(event.uid)#\(event.recurrenceID ?? "single")",
+            scheduledEndAt: event.endsAt
+        )
     }
 
     public func refreshCapturePreflight(requestPermission: Bool = false) async {
@@ -111,6 +137,7 @@ public final class ApplicationModel: ObservableObject {
         session.updatedAt = LectureTimestamp()
         activeSession = session
         persist(session)
+        scheduleAutomaticStop(for: session)
     }
 
     public func pauseRecording() async throws {
@@ -121,6 +148,7 @@ public final class ApplicationModel: ObservableObject {
         activeSession = session
         indicatorStore.pause()
         recordingIndicator = indicatorStore.snapshot
+        persist(session)
     }
 
     public func resumeRecording() async throws {
@@ -135,6 +163,11 @@ public final class ApplicationModel: ObservableObject {
     }
 
     public func stopRecording() async throws {
+        cancelAutomaticStop()
+        try await performStopRecording()
+    }
+
+    private func performStopRecording() async throws {
         guard var session = activeSession,
               session.state == .recording || session.state == .paused else { return }
         indicatorStore.stopping()
@@ -147,6 +180,36 @@ public final class ApplicationModel: ObservableObject {
         indicatorStore.completed()
         recordingIndicator = indicatorStore.snapshot
     }
+
+    private func scheduleAutomaticStop(for session: LectureSession) {
+        cancelAutomaticStop()
+        guard let scheduledEndAt = session.scheduledEndAt?.date else { return }
+        let deadline = scheduledEndAt.addingTimeInterval(automaticStopGracePeriod)
+        automaticStopAt = deadline
+        automaticStopFailureMessage = nil
+        let delay = max(0, deadline.timeIntervalSinceNow)
+        automaticStopTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.automaticStopTask = nil
+            do {
+                try await self.performStopRecording()
+                self.automaticStopAt = nil
+            } catch {
+                self.automaticStopFailureMessage = "课后自动结束失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func cancelAutomaticStop() {
+        automaticStopTask?.cancel()
+        automaticStopTask = nil
+        automaticStopAt = nil
+    }
     private func restoreSession() {
         guard let data = defaults.data(forKey: sessionKey),
               let session = try? JSONDecoder().decode(LectureSession.self, from: data) else { return }
@@ -155,6 +218,8 @@ public final class ApplicationModel: ObservableObject {
                 id: session.id,
                 courseID: session.courseID,
                 title: session.title,
+                scheduledEventID: session.scheduledEventID,
+                scheduledEndAt: session.scheduledEndAt,
                 state: .interrupted,
                 createdAt: session.createdAt,
                 updatedAt: LectureTimestamp()

@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import NaturalLanguage
 import WhisperKit
 
 public struct SpeechRecognitionOutput: Equatable, Sendable {
@@ -23,7 +24,7 @@ public actor WhisperKitSpeechRecognizer: LocalSpeechRecognizing {
 
     public init(modelFolder: URL) async throws {
         whisperKit = try await WhisperKit(WhisperKitConfig(
-            model: SpeechModelDescriptor.smallEnglish.id,
+            model: SpeechModelDescriptor.largeV3Compressed.id,
             modelFolder: modelFolder.path,
             verbose: false,
             prewarm: false,
@@ -33,10 +34,11 @@ public actor WhisperKitSpeechRecognizer: LocalSpeechRecognizing {
     }
 
     public func transcribe(samples: [Float], prompt: String?) async throws -> [SpeechRecognitionOutput] {
-        var options = DecodingOptions(language: "en", wordTimestamps: true)
-        if let prompt, !prompt.isEmpty, let tokenizer = whisperKit.tokenizer {
-            options.promptTokens = tokenizer.encode(text: " \(prompt)")
-        }
+        // The compressed large-v3 model can return an empty transcript when the
+        // legacy small.en prompt-token path is used. Keep the protocol stable,
+        // but let this model decode without manually injected prompt tokens.
+        _ = prompt
+        let options = DecodingOptions(language: "en")
         let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: options)
         return results.flatMap(\.segments).compactMap {
             let text = sanitizeTranscript($0.text)
@@ -83,6 +85,14 @@ public struct LiveTranscriptSegment: Equatable, Sendable {
 }
 
 public actor LiveTranscriptionPipeline {
+    private struct RecognitionJob: Sendable {
+        let samples: [Float]
+        let final: Bool
+        let windowStart: TimeInterval
+        let segmentIndex: Int
+        let windowCompletedAt: ContinuousClock.Instant
+    }
+
     private let sessionID: SessionID
     private let recognizer: any LocalSpeechRecognizing
     private let repository: SQLiteTranscriptRevisionRepository?
@@ -92,6 +102,11 @@ public actor LiveTranscriptionPipeline {
     private var pendingSamples: [Float] = []
     private var consumedSamples = 0
     private var segmentIndex = 0
+    private var nextPartialThreshold: Int
+    private var finalJobs: [RecognitionJob] = []
+    private var pendingPartialJob: RecognitionJob?
+    private var recognitionTask: Task<Void, Never>?
+    private var isFinishing = false
     private var prompt: String?
     private var lastCapturedAt: ContinuousClock.Instant?
     private let latencyTracker: CaptionLatencyTracker
@@ -104,8 +119,8 @@ public actor LiveTranscriptionPipeline {
         sessionID: SessionID,
         recognizer: any LocalSpeechRecognizing,
         repository: SQLiteTranscriptRevisionRepository? = nil,
-        finalWindowSeconds: Double = 10,
-        partialWindowSeconds: Double = 1,
+        finalWindowSeconds: Double = 30,
+        partialWindowSeconds: Double = 5,
         outputBufferLimit: Int = 32,
         latencyTracker: CaptionLatencyTracker = CaptionLatencyTracker()
     ) {
@@ -113,8 +128,11 @@ public actor LiveTranscriptionPipeline {
         self.recognizer = recognizer
         self.repository = repository
         self.latencyTracker = latencyTracker
-        finalWindowSamples = max(1, Int(finalWindowSeconds * Double(sampleRate)))
-        partialWindowSamples = max(1, Int(partialWindowSeconds * Double(sampleRate)))
+        let finalSamples = max(1, Int(finalWindowSeconds * Double(sampleRate)))
+        let partialSamples = max(1, Int(partialWindowSeconds * Double(sampleRate)))
+        finalWindowSamples = finalSamples
+        partialWindowSamples = partialSamples
+        nextPartialThreshold = partialSamples
         let outputStream = BoundedAsyncStream<LiveTranscriptSegment>(limit: outputBufferLimit)
         self.outputStream = outputStream
         segments = outputStream.stream
@@ -138,6 +156,7 @@ public actor LiveTranscriptionPipeline {
     }
 
     public func consume(_ frame: CapturedAudioFrame) async {
+        guard !isFinishing else { return }
         lastCapturedAt = frame.capturedAt
         do {
             pendingSamples.append(contentsOf: try frame.buffer.samples16kMono())
@@ -145,73 +164,132 @@ public actor LiveTranscriptionPipeline {
             await emitGap(sampleCount: Int(frame.buffer.frameLength), reason: "Audio conversion failed")
             return
         }
-        if pendingSamples.count >= finalWindowSamples {
+
+        while pendingSamples.count >= finalWindowSamples {
             let window = Array(pendingSamples.prefix(finalWindowSamples))
             pendingSamples.removeFirst(finalWindowSamples)
-            await recognize(window, final: true, windowCompletedAt: frame.capturedAt)
-        } else if pendingSamples.count >= partialWindowSamples,
-                  pendingSamples.count % partialWindowSamples < Int(frame.buffer.frameLength) {
-            await recognize(pendingSamples, final: false, windowCompletedAt: frame.capturedAt)
+            finalJobs.append(RecognitionJob(
+                samples: window,
+                final: true,
+                windowStart: Double(consumedSamples) / Double(sampleRate),
+                segmentIndex: segmentIndex,
+                windowCompletedAt: frame.capturedAt
+            ))
+            consumedSamples += window.count
+            segmentIndex += 1
+            nextPartialThreshold = partialWindowSamples
         }
+
+        if pendingSamples.count >= nextPartialThreshold {
+            while nextPartialThreshold <= pendingSamples.count {
+                nextPartialThreshold += partialWindowSamples
+            }
+            pendingPartialJob = RecognitionJob(
+                samples: pendingSamples,
+                final: false,
+                windowStart: Double(consumedSamples) / Double(sampleRate),
+                segmentIndex: segmentIndex,
+                windowCompletedAt: frame.capturedAt
+            )
+        }
+        startRecognitionWorkerIfNeeded()
     }
 
     public func finish() async {
+        guard !isFinishing else {
+            await recognitionTask?.value
+            return
+        }
+        isFinishing = true
         if !pendingSamples.isEmpty {
             let samples = pendingSamples
             pendingSamples.removeAll(keepingCapacity: false)
-            await recognize(
-                samples,
+            finalJobs.append(RecognitionJob(
+                samples: samples,
                 final: true,
+                windowStart: Double(consumedSamples) / Double(sampleRate),
+                segmentIndex: segmentIndex,
                 windowCompletedAt: lastCapturedAt ?? .now
-            )
+            ))
+            consumedSamples += samples.count
+            segmentIndex += 1
         }
+        startRecognitionWorkerIfNeeded()
+        await recognitionTask?.value
         outputStream.finish()
         latencyStream.finish()
     }
 
-    private func recognize(
-        _ samples: [Float],
-        final: Bool,
-        windowCompletedAt: ContinuousClock.Instant
-    ) async {
-        let windowStart = Double(consumedSamples) / Double(sampleRate)
+    private func startRecognitionWorkerIfNeeded() {
+        guard recognitionTask == nil,
+              !finalJobs.isEmpty || pendingPartialJob != nil else { return }
+        recognitionTask = Task { [weak self] in
+            await self?.drainRecognitionJobs()
+        }
+    }
+
+    private func drainRecognitionJobs() async {
+        while let job = dequeueRecognitionJob() {
+            await recognize(job)
+        }
+        recognitionTask = nil
+    }
+
+    private func dequeueRecognitionJob() -> RecognitionJob? {
+        if let partial = pendingPartialJob,
+           finalJobs.first.map({ partial.segmentIndex <= $0.segmentIndex }) ?? true {
+            pendingPartialJob = nil
+            return partial
+        }
+        if !finalJobs.isEmpty {
+            return finalJobs.removeFirst()
+        }
+        return nil
+    }
+
+    private func recognize(_ job: RecognitionJob) async {
         do {
-            let outputs = try await recognizer.transcribe(samples: samples, prompt: prompt)
-            guard let output = Self.mergedOutput(outputs) else {
-                if final { consumedSamples += samples.count }
+            let outputs = try await recognizer.transcribe(samples: job.samples, prompt: prompt)
+            let paragraphs = Self.paragraphOutputs(outputs, maximumSentenceCount: 2)
+            guard !paragraphs.isEmpty else {
                 return
             }
-            let segmentID = "segment-\(segmentIndex)"
-            let revision: TranscriptRevision?
-            if final, let repository {
-                revision = try? await repository.createRevision(
+            for (paragraphIndex, output) in paragraphs.enumerated() {
+                let segmentID = "segment-\(job.segmentIndex)-\(paragraphIndex)"
+                let revision: TranscriptRevision?
+                if job.final, let repository {
+                    revision = try? await repository.createRevision(
+                        sessionID: sessionID,
+                        segmentID: segmentID,
+                        startsAt: job.windowStart + output.start,
+                        endsAt: job.windowStart + output.end,
+                        text: output.text,
+                        status: .finalized
+                    )
+                } else {
+                    revision = nil
+                }
+                let segment = LiveTranscriptSegment(
+                    id: segmentID,
                     sessionID: sessionID,
-                    segmentID: segmentID,
-                    startsAt: windowStart + output.start,
-                    endsAt: windowStart + output.end,
+                    start: job.windowStart + output.start,
+                    end: job.windowStart + output.end,
                     text: output.text,
-                    status: .finalized
+                    isFinal: job.final,
+                    revisionID: revision?.id
                 )
-            } else {
-                revision = nil
+                outputStream.yield(segment)
             }
-            let segment = LiveTranscriptSegment(
-                id: segmentID,
-                sessionID: sessionID,
-                start: windowStart + output.start,
-                end: windowStart + output.end,
-                text: output.text,
-                isFinal: final,
-                revisionID: revision?.id
-            )
-            outputStream.yield(segment)
-            if final { segmentIndex += 1 }
-            let latency = await latencyTracker.record(windowCompletedAt: windowCompletedAt)
+            let latency = await latencyTracker.record(windowCompletedAt: job.windowCompletedAt)
             latencyStream.yield(latency)
-            if final { consumedSamples += samples.count }
         } catch {
-            if final {
-                await emitGap(sampleCount: samples.count, reason: error.localizedDescription)
+            if job.final {
+                await emitGap(
+                    start: job.windowStart,
+                    sampleCount: job.samples.count,
+                    segmentIndex: job.segmentIndex,
+                    reason: error.localizedDescription
+                )
             }
         }
     }
@@ -228,8 +306,59 @@ public actor LiveTranscriptionPipeline {
         return SpeechRecognitionOutput(text: text, start: first.start, end: last.end)
     }
 
+    static func paragraphOutputs(
+        _ outputs: [SpeechRecognitionOutput],
+        maximumSentenceCount: Int = 2
+    ) -> [SpeechRecognitionOutput] {
+        guard maximumSentenceCount > 0, let merged = mergedOutput(outputs) else { return [] }
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = merged.text
+        var sentenceRanges: [Range<String.Index>] = []
+        tokenizer.enumerateTokens(in: merged.text.startIndex..<merged.text.endIndex) { range, _ in
+            sentenceRanges.append(range)
+            return true
+        }
+        guard !sentenceRanges.isEmpty else { return [merged] }
+
+        let characterCount = max(1, merged.text.count)
+        let duration = max(0, merged.end - merged.start)
+        return stride(from: 0, to: sentenceRanges.count, by: maximumSentenceCount).map { index in
+            let group = sentenceRanges[index..<min(sentenceRanges.count, index + maximumSentenceCount)]
+            let lowerBound = group.first!.lowerBound
+            let upperBound = group.last!.upperBound
+            let startOffset = merged.text.distance(from: merged.text.startIndex, to: lowerBound)
+            let endOffset = merged.text.distance(from: merged.text.startIndex, to: upperBound)
+            let text = String(merged.text[lowerBound..<upperBound])
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return SpeechRecognitionOutput(
+                text: text,
+                start: merged.start + duration * Double(startOffset) / Double(characterCount),
+                end: merged.start + duration * Double(endOffset) / Double(characterCount)
+            )
+        }
+        .filter { !$0.text.isEmpty }
+    }
+
     private func emitGap(sampleCount: Int, reason: String) async {
         let start = Double(consumedSamples) / Double(sampleRate)
+        let gapSegmentIndex = segmentIndex
+        consumedSamples += sampleCount
+        segmentIndex += 1
+        await emitGap(
+            start: start,
+            sampleCount: sampleCount,
+            segmentIndex: gapSegmentIndex,
+            reason: reason
+        )
+    }
+
+    private func emitGap(
+        start: TimeInterval,
+        sampleCount: Int,
+        segmentIndex: Int,
+        reason: String
+    ) async {
         let end = start + Double(sampleCount) / Double(sampleRate)
         let segmentID = "gap-\(segmentIndex)"
         let gap = LiveTranscriptSegment(
@@ -252,8 +381,6 @@ public actor LiveTranscriptionPipeline {
                 status: .gap
             )
         }
-        consumedSamples += sampleCount
-        segmentIndex += 1
     }
 }
 
@@ -262,7 +389,7 @@ public enum AudioConversionError: Error {
     case conversionFailed
 }
 
-private extension AVAudioPCMBuffer {
+extension AVAudioPCMBuffer {
     func samples16kMono() throws -> [Float] {
         let targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,

@@ -3,6 +3,7 @@ import SwiftUI
 struct WeeklyTimetableView: View {
     let events: [ICSCourseEvent]
     @Binding var weekOffset: Int
+    let selectForRecording: (ICSCourseEvent) -> Void
 
     private let calendar: Calendar
     private let firstHour = 8
@@ -10,9 +11,14 @@ struct WeeklyTimetableView: View {
     private let hourHeight: CGFloat = 66
     private let timeColumnWidth: CGFloat = 58
 
-    init(events: [ICSCourseEvent], weekOffset: Binding<Int>) {
+    init(
+        events: [ICSCourseEvent],
+        weekOffset: Binding<Int>,
+        selectForRecording: @escaping (ICSCourseEvent) -> Void
+    ) {
         self.events = events
         _weekOffset = weekOffset
+        self.selectForRecording = selectForRecording
         var calendar = Calendar(identifier: .gregorian)
         calendar.locale = Locale(identifier: "zh_CN")
         calendar.timeZone = TimeZone(identifier: "Australia/Melbourne") ?? .current
@@ -47,7 +53,7 @@ struct WeeklyTimetableView: View {
             }
         }
         .frame(height: 684)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 18))
+        .background(Color.black.opacity(0.30), in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(nsColor: .separatorColor).opacity(0.72)))
         .clipShape(RoundedRectangle(cornerRadius: 18))
     }
@@ -103,15 +109,19 @@ struct WeeklyTimetableView: View {
     private func eventBlocks(dayColumnWidth: CGFloat) -> some View {
         ForEach(Array(visibleEvents.enumerated()), id: \.offset) { _, event in
             if let dayIndex = days.firstIndex(where: { calendar.isDate($0, inSameDayAs: event.startsAt) }) {
-                TimetableEventBlock(event: event)
-                    .frame(
-                        width: dayColumnWidth - 10,
-                        height: max(44, blockHeight(for: event))
-                    )
-                    .offset(
-                        x: timeColumnWidth + CGFloat(dayIndex) * dayColumnWidth + 5,
-                        y: yOffset(for: event)
-                    )
+                Button { selectForRecording(event) } label: {
+                    TimetableEventBlock(event: event)
+                }
+                .buttonStyle(.plain)
+                .frame(
+                    width: dayColumnWidth - 10,
+                    height: max(44, blockHeight(for: event))
+                )
+                .offset(
+                    x: timeColumnWidth + CGFloat(dayIndex) * dayColumnWidth + 5,
+                    y: yOffset(for: event)
+                )
+                .accessibilityLabel("记录 \(event.summary)")
             }
         }
     }

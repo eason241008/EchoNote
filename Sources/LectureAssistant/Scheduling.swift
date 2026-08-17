@@ -42,6 +42,8 @@ public struct ICSCourseEvent: Equatable, Sendable {
     public let endsAt: Date
     public let recurrenceID: String?
     public let location: String?
+    public let courseCode: String?
+    public let activity: String?
 
     public init(
         uid: String,
@@ -49,7 +51,9 @@ public struct ICSCourseEvent: Equatable, Sendable {
         startsAt: Date,
         endsAt: Date,
         recurrenceID: String?,
-        location: String? = nil
+        location: String? = nil,
+        courseCode: String? = nil,
+        activity: String? = nil
     ) {
         self.uid = uid
         self.summary = summary
@@ -57,6 +61,8 @@ public struct ICSCourseEvent: Equatable, Sendable {
         self.endsAt = endsAt
         self.recurrenceID = recurrenceID
         self.location = location
+        self.courseCode = courseCode
+        self.activity = activity
     }
 }
 
@@ -78,13 +84,15 @@ public struct ICSParser: Sendable {
             if line == "END:VEVENT" {
                 guard inEvent else { continue }
                 guard let uid = current["UID"] else { throw ICSParserError.missingRequiredField("UID") }
-                guard let summary = current["SUMMARY"] else { throw ICSParserError.missingRequiredField("SUMMARY") }
+                guard let rawSummary = current["SUMMARY"] else { throw ICSParserError.missingRequiredField("SUMMARY") }
                 guard let startValue = current["DTSTART"], let endValue = current["DTEND"] else {
                     throw ICSParserError.missingRequiredField("DTSTART/DTEND")
                 }
                 let start = try parseDate(startValue, timeZoneID: current["DTSTART-TZID"])
                 let end = try parseDate(endValue, timeZoneID: current["DTEND-TZID"])
                 let recurrenceID = current["RECURRENCE-ID"]
+                let summary = unescapedText(rawSummary)
+                let eventDescription = current["DESCRIPTION"].map(unescapedText)
                 for (index, occurrenceStart) in expand(
                     start: start,
                     rule: recurrenceRule,
@@ -97,7 +105,9 @@ public struct ICSParser: Sendable {
                         startsAt: occurrenceStart,
                         endsAt: occurrenceStart.addingTimeInterval(duration),
                         recurrenceID: recurrenceID ?? (recurrenceRule == nil ? "single" : "occurrence-\(index)"),
-                        location: current["LOCATION"]
+                        location: current["LOCATION"].map(unescapedText),
+                        courseCode: courseCode(in: eventDescription),
+                        activity: activity(in: summary)
                     ))
                 }
                 inEvent = false; continue
@@ -136,6 +146,31 @@ public struct ICSParser: Sendable {
             guard pieces.count == 2, pieces[0] == Substring(name) else { return nil }
             return String(pieces[1])
         }.first
+    }
+
+    private func unescapedText(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\,", with: ",")
+            .replacingOccurrences(of: "\\;", with: ";")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+    }
+
+    private func courseCode(in description: String?) -> String? {
+        guard let description,
+              let expression = try? NSRegularExpression(pattern: #"\b([A-Z]{4}\d{5})_"#),
+              let match = expression.firstMatch(
+                in: description,
+                range: NSRange(description.startIndex..., in: description)
+              ),
+              let range = Range(match.range(at: 1), in: description) else { return nil }
+        return String(description[range])
+    }
+
+    private func activity(in summary: String) -> String? {
+        let components = summary.split(separator: ",", omittingEmptySubsequences: true)
+        guard components.count > 1 else { return nil }
+        let value = components.last?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
     }
 
     private func expand(start: Date, rule: String?, limit: Int) -> [Date] {

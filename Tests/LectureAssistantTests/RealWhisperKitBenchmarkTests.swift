@@ -21,8 +21,9 @@ final class RealWhisperKitBenchmarkTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: audioURL) }
         try synthesize("The lecture discusses dynamic programming and optimal substructure.", to: audioURL)
         let samples = try loadSamples(from: audioURL)
+        let memoryBeforeLoad = residentMemory()
         let recognizer = try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
-        let memoryBefore = residentMemory()
+        let memoryAfterLoad = residentMemory()
         let cpuBefore = cpuTime()
         let wallStart = ContinuousClock.now
         var latencies: [Double] = []
@@ -37,11 +38,12 @@ final class RealWhisperKitBenchmarkTests: XCTestCase {
             XCTAssertFalse(result.isEmpty)
             latencies.append(start.duration(to: .now).seconds)
         }
-        let memoryGrowth = max(0, residentMemory() - memoryBefore)
+        let memoryAtEnd = residentMemory()
+        let memoryGrowth = max(0, memoryAtEnd - memoryAfterLoad)
         let cpu = max(0, cpuTime() - cpuBefore)
         let median = latencies.sorted()[latencies.count / 2]
         let wall = wallStart.duration(to: .now).seconds
-        print("REAL_WHISPER_BENCHMARK windows=\(windowCount) median=\(median) wall=\(wall) cpu=\(cpu) rss_growth=\(memoryGrowth)")
+        print("REAL_WHISPER_BENCHMARK windows=\(windowCount) median=\(median) wall=\(wall) cpu=\(cpu) rss_load_delta=\(max(0, memoryAfterLoad - memoryBeforeLoad)) rss_end=\(memoryAtEnd) rss_growth=\(memoryGrowth)")
         XCTAssertLessThan(median, 5)
         XCTAssertLessThan(memoryGrowth, 2_000_000_000)
     }

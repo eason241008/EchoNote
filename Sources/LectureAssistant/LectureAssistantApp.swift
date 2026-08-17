@@ -30,6 +30,11 @@ private final class LectureAssistantAppDelegate: NSObject, NSApplicationDelegate
         }
         window.setContentSize(NSSize(width: 1120, height: 760))
         window.minSize = NSSize(width: 940, height: 640)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.titlebarAppearsTransparent = true
+        window.styleMask.insert(.fullSizeContentView)
+        window.hasShadow = true
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -55,7 +60,10 @@ struct EchoNoteApp: App {
                 library: runtime.library,
                 runtimeSettings: runtime.settings,
                 speechModel: runtime.speechModel,
-                translationProvider: runtime.translationProvider
+                translationProvider: runtime.translationProvider,
+                prewarmSpeechRecognizer: {
+                    try await runtime.captureService.prewarmRecognizer()
+                }
             )
         }
         .defaultSize(width: 1120, height: 760)
@@ -103,17 +111,29 @@ private enum AppSection: String, CaseIterable, Identifiable {
 }
 
 private enum AppPalette {
-    static let canvas = Color(nsColor: .windowBackgroundColor)
-    static let sidebar = Color(nsColor: .underPageBackgroundColor)
-    static let card = Color(nsColor: .controlBackgroundColor)
-    static let elevated = Color(nsColor: .textBackgroundColor)
+    static let canvas = Color.clear
+    static let sidebar = Color.black.opacity(0.24)
+    static let card = Color.black.opacity(0.34)
+    static let elevated = Color.black.opacity(0.42)
     static let primary = Color(nsColor: .labelColor)
     static let sage = Color(nsColor: .controlAccentColor)
     static let sageSoft = Color(nsColor: .controlAccentColor).opacity(0.22)
     static let blueSoft = Color(nsColor: .selectedContentBackgroundColor).opacity(0.28)
     static let coral = Color(red: 0.93, green: 0.43, blue: 0.39)
     static let warningSoft = Color.orange.opacity(0.12)
-    static let border = Color(nsColor: .separatorColor).opacity(0.72)
+    static let border = Color.white.opacity(0.13)
+}
+
+private struct WindowGlassBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .underWindowBackground
+        view.blendingMode = .behindWindow
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 struct ContentView: View {
@@ -124,9 +144,9 @@ struct ContentView: View {
     @ObservedObject var runtimeSettings: RuntimeSettingsModel
     @ObservedObject var speechModel: SpeechModelManager
     let translationProvider: AppleTranslationProvider
+    let prewarmSpeechRecognizer: () async throws -> Void
     @AppStorage("lecture-assistant.selected-section")
     private var selectionRawValue = AppSection.recording.rawValue
-    @State private var title = "今天的课程"
     @State private var errorMessage: String?
     @State private var translationServiceState = AppleTranslationServiceState.preparing
     @State private var translationConfiguration = TranslationSession.Configuration(
@@ -139,6 +159,14 @@ struct ContentView: View {
         get { AppSection(rawValue: selectionRawValue) ?? .recording }
         nonmutating set { selectionRawValue = newValue.rawValue }
     }
+    private var latestCaptionUpdateToken: String {
+        guard let segment = captionWorkspace.segments.last else { return "empty" }
+        return [
+            segment.id,
+            segment.text,
+            captionWorkspace.translation(for: segment) ?? "",
+        ].joined(separator: "|")
+    }
     var body: some View {
         NavigationSplitView {
             sidebar
@@ -146,25 +174,45 @@ struct ContentView: View {
         } detail: {
             ZStack {
                 AppPalette.canvas.ignoresSafeArea()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
-                        pageHeader
-                        pageContent
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 24) {
+                            pageHeader
+                            pageContent
+                            Color.clear
+                                .frame(height: 1)
+                                .id("latest-caption-page-bottom")
+                        }
+                        .padding(32)
+                        .frame(maxWidth: 980, alignment: .leading)
                     }
-                    .padding(32)
-                    .frame(maxWidth: 980, alignment: .leading)
+                    .onChange(of: latestCaptionUpdateToken) {
+                        guard selection == .recording || selection == .captions else { return }
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("latest-caption-page-bottom", anchor: .bottom)
+                        }
+                    }
                 }
             }
         }
+        .background(WindowGlassBackground().ignoresSafeArea())
         .navigationSplitViewStyle(.balanced)
         .tint(AppPalette.sage)
         .frame(minWidth: 940, minHeight: 640)
         .preferredColorScheme(.dark)
         .task {
             await speechModel.refresh()
-            captionWorkspace.updateTranscriptionState(
-                speechModel.isReady ? "本地模型已就绪" : "本地模型未安装"
-            )
+            if speechModel.isReady {
+                captionWorkspace.updateTranscriptionState("正在预热本地模型")
+                do {
+                    try await prewarmSpeechRecognizer()
+                    captionWorkspace.updateTranscriptionState("本地模型已就绪")
+                } catch {
+                    captionWorkspace.updateTranscriptionState("本地模型预热失败")
+                }
+            } else {
+                captionWorkspace.updateTranscriptionState("本地模型未安装")
+            }
             await model.refreshCapturePreflight()
             await timetable.refresh()
         }
@@ -180,11 +228,24 @@ struct ContentView: View {
                 session: AppleTranslationSessionAdapter(session: session)
             )
         }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                if await translationProvider.needsRunnerRestart() {
+                    translationConfiguration.invalidate()
+                }
+            }
+        }
         .onChange(of: speechModel.state) {
             captionWorkspace.updateTranscriptionState(
                 speechModel.isReady ? "本地模型已就绪" : "本地模型未安装"
             )
             Task { await model.refreshCapturePreflight() }
+        }
+        .onChange(of: model.recordingIndicator.state) {
+            if model.recordingIndicator.state == .recording {
+                showCaptionOverlay()
+            }
         }
     }
 
@@ -279,28 +340,35 @@ struct ContentView: View {
             RecordingPage(
                 model: model,
                 captionWorkspace: captionWorkspace,
-                title: $title,
+                timetable: timetable,
                 errorMessage: $errorMessage,
-                run: run
+                run: run,
+                openSchedule: { selection = .schedule }
             )
         case .schedule:
-            SchedulePage(store: timetable)
-        case .captions:
-            CaptionPage(model: captionWorkspace) {
-                if overlayController == nil {
-                    overlayController = CaptionOverlayWindowController(model: captionWorkspace)
-                }
-                overlayController?.show()
-            } hideOverlay: {
-                overlayController?.hide()
+            SchedulePage(store: timetable) { event in
+                timetable.selectForRecording(event)
+                selection = .recording
             }
+        case .captions:
+            CaptionPage(
+                model: captionWorkspace,
+                showOverlay: showCaptionOverlay,
+                refreshOverlay: {
+                    overlayController?.refreshPresentation()
+                    if overlayController?.isVisible == true {
+                        overlayController?.show()
+                    }
+                }
+            )
         case .library:
             LibraryPage(model: library)
         case .settings:
             SettingsPage(
                 translationState: translationServiceState,
                 runtime: runtimeSettings,
-                speechModel: speechModel
+                speechModel: speechModel,
+                prewarmSpeechRecognizer: prewarmSpeechRecognizer
             )
         }
     }
@@ -315,14 +383,22 @@ struct ContentView: View {
             }
         }
     }
+
+    private func showCaptionOverlay() {
+        if overlayController == nil {
+            overlayController = CaptionOverlayWindowController(model: captionWorkspace)
+        }
+        overlayController?.show()
+    }
 }
 
 private struct RecordingPage: View {
     @ObservedObject var model: ApplicationModel
     @ObservedObject var captionWorkspace: CaptionWorkspaceModel
-    @Binding var title: String
+    @ObservedObject var timetable: TimetableStore
     @Binding var errorMessage: String?
     let run: (@escaping () async throws -> Void) -> Void
+    let openSchedule: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -350,55 +426,10 @@ private struct RecordingPage: View {
             }
 
             SoftCard {
-                VStack(alignment: .leading, spacing: 18) {
-                    Label("新建课堂记录", systemImage: "plus.circle.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(AppPalette.primary)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("课程名称")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
-                        TextField("例如：算法与数据结构", text: $title)
-                            .textFieldStyle(.plain)
-                            .padding(.horizontal, 14)
-                            .frame(height: 44)
-                            .background(AppPalette.elevated, in: RoundedRectangle(cornerRadius: 10))
-                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(AppPalette.border))
-                    }
-
-                    HStack(spacing: 12) {
-                        Button {
-                            model.prepareSession(title: title)
-                            run {
-                                await model.refreshCapturePreflight(requestPermission: true)
-                            }
-                        } label: {
-                            Label("准备课堂", systemImage: "checkmark.circle")
-                                .frame(minWidth: 108)
-                        }
-                        .buttonStyle(SecondaryActionButtonStyle())
-
-                        Button {
-                            run { try await model.startRecording() }
-                        } label: {
-                            Label("开始录音", systemImage: "record.circle")
-                                .frame(minWidth: 108)
-                        }
-                        .buttonStyle(PrimaryActionButtonStyle())
-                        .disabled(!model.canStartRecording)
-
-                        Button("暂停") { run { try await model.pauseRecording() } }
-                            .buttonStyle(SecondaryActionButtonStyle())
-                            .disabled(model.activeSession?.state != .recording)
-
-                        Button("停止") { run { try await model.stopRecording() } }
-                            .buttonStyle(SecondaryActionButtonStyle())
-                            .disabled(
-                                model.activeSession?.state != .recording
-                                    && model.activeSession?.state != .paused
-                            )
-                    }
+                TimelineView(.periodic(from: .now, by: 30)) { timeline in
+                    recordingSetup(
+                        context: timetable.recordingContext(at: timeline.date)
+                    )
                 }
             }
             if !model.isRecordingPolicyAcknowledged {
@@ -438,6 +469,13 @@ private struct RecordingPage: View {
             if let errorMessage {
                 InlineNotice(icon: "xmark.circle.fill", text: errorMessage, tint: AppPalette.coral)
             }
+            if let automaticStopFailureMessage = model.automaticStopFailureMessage {
+                InlineNotice(
+                    icon: "exclamationmark.triangle.fill",
+                    text: automaticStopFailureMessage,
+                    tint: AppPalette.coral
+                )
+            }
 
             SoftCard {
                 VStack(alignment: .leading, spacing: 12) {
@@ -468,15 +506,113 @@ private struct RecordingPage: View {
                 }
             }
 
+            if captionWorkspace.postClassTranscriptionState != "等待课程结束" {
+                InlineNotice(
+                    icon: "text.badge.checkmark",
+                    text: captionWorkspace.postClassTranscriptionState,
+                    tint: AppPalette.sage
+                )
+            }
+
             Text("原始课堂音频默认仅在本机保留 30 天，可在“课程资料”中提前删除或延长保留时间。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func recordingSetup(context: TimetableRecordingContext?) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Label("课表课堂记录", systemImage: "calendar.badge.clock")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(AppPalette.primary)
+
+            if let activeSession = model.activeSession,
+               activeSession.state == .recording || activeSession.state == .paused {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(activeSession.title)
+                        .font(.headline)
+                    Text(activeSession.state == .paused ? "录音已暂停" : "正在记录本节课")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            } else if let context {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(context.title)
+                        .font(.headline)
+                    Text(
+                        "\(context.event.startsAt.formatted(date: .abbreviated, time: .shortened)) – \(context.event.endsAt.formatted(date: .omitted, time: .shortened))"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    if let location = context.event.location, !location.isEmpty {
+                        Text(location).font(.caption).foregroundStyle(.tertiary)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("当前时间没有可记录的课表课程。")
+                        .foregroundStyle(.secondary)
+                    Button("从我的课表选择课程", action: openSchedule)
+                        .buttonStyle(SecondaryActionButtonStyle())
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    guard let context else { return }
+                    model.prepareSession(for: context)
+                    run {
+                        await model.refreshCapturePreflight(requestPermission: true)
+                    }
+                } label: {
+                    Label("准备本节课", systemImage: "checkmark.circle")
+                        .frame(minWidth: 108)
+                }
+                .buttonStyle(SecondaryActionButtonStyle())
+                .disabled(context == nil || model.activeSession?.state == .recording || model.activeSession?.state == .paused)
+
+                Button {
+                    run { try await model.startRecording() }
+                } label: {
+                    Label("开始录音", systemImage: "record.circle")
+                        .frame(minWidth: 108)
+                }
+                .buttonStyle(PrimaryActionButtonStyle())
+                .disabled(!model.canStartRecording)
+
+                if model.activeSession?.state == .paused {
+                    Button("继续") { run { try await model.resumeRecording() } }
+                        .buttonStyle(SecondaryActionButtonStyle())
+                } else {
+                    Button("暂停") { run { try await model.pauseRecording() } }
+                        .buttonStyle(SecondaryActionButtonStyle())
+                        .disabled(model.activeSession?.state != .recording)
+                }
+
+                Button("停止") { run { try await model.stopRecording() } }
+                    .buttonStyle(SecondaryActionButtonStyle())
+                    .disabled(
+                        model.activeSession?.state != .recording
+                            && model.activeSession?.state != .paused
+                    )
+            }
+
+            if let automaticStopAt = model.automaticStopAt {
+                Label(
+                    "将在下课后 5 分钟自动结束（\(automaticStopAt.formatted(date: .omitted, time: .shortened))）",
+                    systemImage: "timer"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
         }
     }
 }
 
 private struct SchedulePage: View {
     @ObservedObject var store: TimetableStore
+    let selectForRecording: (ICSCourseEvent) -> Void
     @State private var isImporting = false
     @State private var weekOffset = 0
 
@@ -540,7 +676,11 @@ private struct SchedulePage: View {
                     .padding(.vertical, 46)
                 }
             } else {
-                WeeklyTimetableView(events: store.events, weekOffset: $weekOffset)
+                WeeklyTimetableView(
+                    events: store.events,
+                    weekOffset: $weekOffset,
+                    selectForRecording: selectForRecording
+                )
             }
 
             if let importMessage = store.statusMessage {
@@ -619,7 +759,16 @@ private struct ScheduleEventRow: View {
 private struct CaptionPage: View {
     @ObservedObject var model: CaptionWorkspaceModel
     let showOverlay: () -> Void
-    let hideOverlay: () -> Void
+    let refreshOverlay: () -> Void
+
+    private var latestUpdateToken: String {
+        guard let segment = model.segments.last else { return "empty" }
+        return [
+            segment.id,
+            segment.text,
+            model.translation(for: segment) ?? "",
+        ].joined(separator: "|")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -642,6 +791,19 @@ private struct CaptionPage: View {
                     }
                     .pickerStyle(.segmented)
 
+                    Picker("字幕位置", selection: $model.settings.presentationMode) {
+                        Text("普通浮窗").tag(CaptionPresentationMode.floatingWindow)
+                        Text("灵动岛式").tag(CaptionPresentationMode.dynamicIsland)
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: model.settings.presentationMode) {
+                        refreshOverlay()
+                    }
+
+                    Text("“灵动岛式”会把字幕固定在屏幕顶部中央、贴近 Mac 刘海；macOS 不提供真正嵌入硬件刘海的公开接口。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
                     HStack(spacing: 24) {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("文字大小  \(Int(model.settings.textSize))")
@@ -655,12 +817,11 @@ private struct CaptionPage: View {
                         }
                     }
 
-                    HStack(spacing: 12) {
-                        Button("显示字幕浮窗", action: showOverlay)
-                            .buttonStyle(PrimaryActionButtonStyle())
-                        Button("快速隐藏", action: hideOverlay)
-                            .buttonStyle(SecondaryActionButtonStyle())
-                    }
+                    Button("重新显示字幕浮窗", action: showOverlay)
+                        .buttonStyle(SecondaryActionButtonStyle())
+                    Text("开始录音时浮窗会自动出现；隐藏和关闭按钮位于浮窗右上角。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -678,17 +839,29 @@ private struct CaptionPage: View {
                         }
                         .padding(.vertical, 26)
                     } else {
-                        ForEach(model.segments, id: \.id) { segment in
-                            HStack(alignment: .top, spacing: 12) {
-                                Text(formatTime(segment.start))
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                CaptionSegmentText(model: model, segment: segment)
-                                    .font(.body)
-                                    .foregroundStyle(segment.isGap ? AppPalette.coral : AppPalette.primary)
-                                Spacer()
+                        ScrollViewReader { proxy in
+                            ScrollView(.vertical) {
+                                LazyVStack(alignment: .leading, spacing: 0) {
+                                    ForEach(model.segments, id: \.id) { segment in
+                                        HStack(alignment: .top, spacing: 12) {
+                                            Text(formatTime(segment.start))
+                                                .font(.caption.monospacedDigit())
+                                                .foregroundStyle(.secondary)
+                                            CaptionSegmentText(model: model, segment: segment)
+                                                .font(.body)
+                                                .foregroundStyle(segment.isGap ? AppPalette.coral : AppPalette.primary)
+                                            Spacer()
+                                        }
+                                        .padding(.vertical, 6)
+                                        .id(segment.id)
+                                    }
+                                }
                             }
-                            .padding(.vertical, 6)
+                            .frame(maxHeight: 420)
+                            .onAppear { scrollToLatest(using: proxy, animated: false) }
+                            .onChange(of: latestUpdateToken) {
+                                scrollToLatest(using: proxy, animated: true)
+                            }
                         }
                     }
                 }
@@ -698,6 +871,19 @@ private struct CaptionPage: View {
 
     private func formatTime(_ value: TimeInterval) -> String {
         String(format: "%02d:%02d", Int(value) / 60, Int(value) % 60)
+    }
+
+    private func scrollToLatest(using proxy: ScrollViewProxy, animated: Bool) {
+        guard let id = model.segments.last?.id else { return }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(id, anchor: .bottom)
+            }
+        }
     }
 }
 
@@ -851,6 +1037,36 @@ private struct LibraryPage: View {
                                     .padding(.vertical, 5)
                                 }
                             }
+                            if !model.selectedPostClassTranscripts.isEmpty {
+                                Divider()
+                                Text("课后整课校对稿")
+                                    .font(.headline)
+                                Text("独立版本，不会覆盖上面的实时原稿。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                ForEach(model.selectedPostClassTranscripts) { document in
+                                    DisclosureGroup(
+                                        "\(document.generatedAt.formatted(date: .abbreviated, time: .shortened)) · \(document.segments.count) 段"
+                                    ) {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            ForEach(document.segments) { segment in
+                                                VStack(alignment: .leading, spacing: 3) {
+                                                    Text(String(
+                                                        format: "%02d:%02d",
+                                                        Int(segment.start) / 60,
+                                                        Int(segment.start) % 60
+                                                    ))
+                                                    .font(.caption.monospacedDigit())
+                                                    .foregroundStyle(.secondary)
+                                                    Text(segment.text)
+                                                        .foregroundStyle(AppPalette.primary)
+                                                }
+                                            }
+                                        }
+                                        .padding(.top, 8)
+                                    }
+                                }
+                            }
                         }
                     } else {
                         Text("从左侧选择一场课程。")
@@ -876,6 +1092,7 @@ private struct SettingsPage: View {
     let translationState: AppleTranslationServiceState
     @ObservedObject var runtime: RuntimeSettingsModel
     @ObservedObject var speechModel: SpeechModelManager
+    let prewarmSpeechRecognizer: () async throws -> Void
     @State private var timetableURL = ""
     @State private var modelErrorMessage: String?
 
@@ -906,7 +1123,7 @@ private struct SettingsPage: View {
                 VStack(alignment: .leading, spacing: 14) {
                     Label("本地英文转写模型", systemImage: "waveform")
                         .font(.headline)
-                    Text("Whisper small.en · 约 500 MB。下载并验证成功后才能开始录音。")
+                    Text("WhisperKit large-v3 压缩版 · 约 626 MB。针对 Apple Silicon 优化，下载并验证成功后才能开始录音。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     if case let .downloading(progress) = speechModel.state {
@@ -920,7 +1137,12 @@ private struct SettingsPage: View {
                     HStack(spacing: 12) {
                         if speechModel.isReady {
                             Button("重新验证") {
-                                Task { await speechModel.refresh() }
+                                Task {
+                                    await speechModel.refresh()
+                                    if speechModel.isReady {
+                                        try? await prewarmSpeechRecognizer()
+                                    }
+                                }
                             }
                             .buttonStyle(SecondaryActionButtonStyle())
                             Button("删除模型", role: .destructive) {
@@ -939,6 +1161,7 @@ private struct SettingsPage: View {
                                 Task {
                                     do {
                                         try await speechModel.downloadAfterUserConfirmation()
+                                        try await prewarmSpeechRecognizer()
                                         modelErrorMessage = nil
                                     } catch {
                                         modelErrorMessage = error.localizedDescription
@@ -961,11 +1184,11 @@ private struct SettingsPage: View {
 
             SoftCard {
                 VStack(alignment: .leading, spacing: 12) {
-                    Label("Apple 本地中文翻译", systemImage: "character.book.closed.fill")
+                    Label("本地中文翻译", systemImage: "character.book.closed.fill")
                         .font(.headline)
                     Text(translationState.displayText)
                         .font(.system(size: 15, weight: .medium))
-                    Text("英文到简体中文的翻译由 macOS Translation framework 在本机完成，不使用 DeepSeek、OMP 配置或 API 密钥。首次使用时，系统可能要求下载语言包。")
+                    Text("WhisperKit large-v3 负责英文语音识别；它的翻译任务只能输出英文，不能生成简体中文。为保持现有双语字幕，英文到简体中文仍由 macOS 本地语言包完成，不使用云端 API。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     if case .unavailable = translationState {
@@ -1132,7 +1355,7 @@ private struct SecondaryActionButtonStyle: ButtonStyle {
         InteractiveButtonBody(
             configuration: configuration,
             foreground: AppPalette.primary,
-            background: Color(nsColor: .controlBackgroundColor),
+            background: Color.black.opacity(0.38),
             border: AppPalette.border,
             weight: .medium
         )

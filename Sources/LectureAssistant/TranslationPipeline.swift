@@ -125,6 +125,7 @@ public actor TranslationPipeline {
     private let repository: SQLiteTranslationRepository?
     private let batchingDelay: Duration
     private let capacity: Int
+    private let maximumBatchSize: Int
     private var pending: [PendingTranslationRevision] = []
     private var flushTask: Task<Void, Never>?
     private var terminology: [String] = []
@@ -137,12 +138,14 @@ public actor TranslationPipeline {
         provider: (any SimplifiedChineseTranslationProviding)?,
         repository: SQLiteTranslationRepository? = nil,
         batchingDelay: Duration = .milliseconds(500),
-        capacity: Int = 64
+        capacity: Int = 64,
+        maximumBatchSize: Int = 8
     ) {
         self.provider = provider
         self.repository = repository
         self.batchingDelay = batchingDelay
         self.capacity = max(1, capacity)
+        self.maximumBatchSize = max(1, maximumBatchSize)
         let stateStream = BoundedAsyncStream<TranslationPipelineState>(limit: 32)
         self.stateStream = stateStream
         states = stateStream.stream
@@ -201,8 +204,9 @@ public actor TranslationPipeline {
     @discardableResult
     private func flushNow() async -> Bool {
         guard let provider, !pending.isEmpty else { return true }
-        let batch = pending
-        pending.removeAll(keepingCapacity: true)
+        let batchSize = min(maximumBatchSize, pending.count)
+        let batch = Array(pending.prefix(batchSize))
+        pending.removeFirst(batchSize)
         stateStream.yield(.translating(batch.count))
         do {
             let segments = try batch.map {

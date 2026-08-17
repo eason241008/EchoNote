@@ -41,12 +41,19 @@ public enum AVFoundationCaptureError: LocalizedError, Equatable {
 private final class CaptureWriterState: @unchecked Sendable {
     let queue = DispatchQueue(label: "com.lectureassistant.capture-writer", qos: .userInitiated)
     var audioFile: AVAudioFile?
+    var stagingURL: URL?
     var chunkID: UUID?
     var frameStream: BoundedAsyncStream<CapturedAudioFrame>?
     var failure: Error?
 }
 
 public actor AVFoundationLectureCaptureService: LectureCaptureService {
+    // Passing a non-nil format makes AVFAudio call SetOutputFormat on the
+    // microphone node. That can raise an Objective-C exception while macOS is
+    // still settling a newly selected route. A nil tap format keeps the
+    // device-negotiated format and avoids the uncatchable SIGABRT.
+    static var inputTapFormat: AVAudioFormat? { nil }
+
     private let storage: SessionStorage
     private let engine: AVAudioEngine
     private let writer = CaptureWriterState()
@@ -57,10 +64,11 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
     private var isPaused = false
     private let frameStream: BoundedAsyncStream<CapturedAudioFrame>
     public nonisolated let frames: AsyncStream<CapturedAudioFrame>
+    public nonisolated var droppedFrameCount: Int { frameStream.droppedCount }
 
     public init(
         storage: SessionStorage,
-        frameBufferLimit: Int = 8,
+        frameBufferLimit: Int = 512,
         timeline: CaptureTimelineRecorder? = nil
     ) {
         self.storage = storage
@@ -103,20 +111,25 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
             sessionID: preparation.session.id,
             chunkID: chunkID
         )
+        var tapInstalled = false
         do {
-            let file = try AVAudioFile(forWriting: stagingURL, settings: format.settings)
-            writer.audioFile = file
+            writer.audioFile = nil
+            writer.stagingURL = stagingURL
             writer.chunkID = chunkID
             writer.failure = nil
-            installTap(inputNode: inputNode, format: format, sessionID: preparation.session.id)
+            installTap(inputNode: inputNode)
+            tapInstalled = true
             engine.prepare()
             try engine.start()
             recordingStartedAt = .now
             isRunning = true
             isPaused = false
         } catch {
-            inputNode.removeTap(onBus: 0)
+            if tapInstalled {
+                inputNode.removeTap(onBus: 0)
+            }
             writer.audioFile = nil
+            writer.stagingURL = nil
             writer.chunkID = nil
             await storage.abandonActiveChunk(sessionID: preparation.session.id)
             throw AVFoundationCaptureError.audioEngineFailed
@@ -126,6 +139,7 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
     public func pause() async throws {
         guard isRunning else { return }
         _ = try? await timeline?.record(.paused)
+        engine.pause()
         isPaused = true
     }
 
@@ -145,7 +159,8 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         try await flushWriterQueue()
-        guard let chunkID = writer.chunkID else {
+        frameStream.finish()
+        guard let chunkID = writer.chunkID, writer.audioFile != nil else {
             _ = try? await timeline?.record(.storageFailure)
             await storage.abandonActiveChunk(sessionID: preparation.session.id)
             resetCaptureState()
@@ -168,19 +183,30 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
         resetCaptureState()
     }
 
-    private func installTap(
-        inputNode: AVAudioInputNode,
-        format: AVAudioFormat,
-        sessionID: SessionID
-    ) {
-        inputNode.installTap(onBus: 0, bufferSize: 2_048, format: format) { [writer] buffer, _ in
+    private func installTap(inputNode: AVAudioInputNode) {
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 2_048,
+            format: Self.inputTapFormat
+        ) { [writer] buffer, _ in
             guard let copy = buffer.deepCopy() else { return }
             let capturedAt = ContinuousClock.now
             let activity = AudioActivityMeter.measure(buffer: copy)
             writer.queue.async {
-                guard writer.failure == nil, let file = writer.audioFile,
-                      writer.chunkID != nil else { return }
+                guard writer.failure == nil, writer.chunkID != nil,
+                      let stagingURL = writer.stagingURL else { return }
                 do {
+                    let file: AVAudioFile
+                    if let existingFile = writer.audioFile {
+                        file = existingFile
+                    } else {
+                        let newFile = try AVAudioFile(
+                            forWriting: stagingURL,
+                            settings: copy.format.settings
+                        )
+                        writer.audioFile = newFile
+                        file = newFile
+                    }
                     try file.write(from: copy)
                     writer.frameStream?.yield(
                         CapturedAudioFrame(
@@ -204,6 +230,7 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
 
     private func resetCaptureState() {
         writer.audioFile = nil
+        writer.stagingURL = nil
         writer.chunkID = nil
         recordingStartedAt = nil
         isRunning = false

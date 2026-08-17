@@ -89,6 +89,7 @@ final class CaptionWorkspaceTests: XCTestCase {
         let first = CaptionWorkspaceModel(defaults: defaults)
         first.settings.textSize = 36
         first.settings.opacity = 0.7
+        first.settings.presentationMode = .dynamicIsland
         first.updateOverlayPosition(x: 210, y: 120)
         first.quickHide()
 
@@ -96,8 +97,39 @@ final class CaptionWorkspaceTests: XCTestCase {
 
         XCTAssertEqual(restored.settings.textSize, 36)
         XCTAssertEqual(restored.settings.opacity, 0.7)
+        XCTAssertEqual(restored.settings.presentationMode, .dynamicIsland)
         XCTAssertEqual(restored.settings.positionX, 210)
         XCTAssertEqual(restored.settings.positionY, 120)
         XCTAssertTrue(restored.settings.isHidden)
+    }
+
+    func testRecentSegmentsKeepsThreeRecordsInsteadOfOnlyLatest() {
+        let model = CaptionWorkspaceModel()
+        let sessionID = SessionID()
+        for index in 0..<5 {
+            model.append(LiveTranscriptSegment(
+                id: "segment-\(index)",
+                sessionID: sessionID,
+                start: Double(index),
+                end: Double(index + 1),
+                text: "line \(index)",
+                isFinal: true
+            ))
+        }
+
+        XCTAssertEqual(model.recentSegments().map(\.text), ["line 2", "line 3", "line 4"])
+    }
+
+    func testLegacyDisplaySettingsDecodeWithoutPresentationMode() throws {
+        let data = Data(
+            #"{"languageVisibility":"englishOnly","textSize":38,"opacity":0.8,"positionX":21,"positionY":22,"isHidden":false}"#.utf8
+        )
+
+        let settings = try JSONDecoder().decode(CaptionDisplaySettings.self, from: data)
+
+        XCTAssertEqual(settings.presentationMode, .floatingWindow)
+        XCTAssertEqual(settings.languageVisibility, .englishOnly)
+        XCTAssertEqual(settings.textSize, 38)
+        XCTAssertEqual(settings.positionX, 21)
     }
 }

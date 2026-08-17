@@ -118,6 +118,13 @@ public struct SessionDirectoryLayout: Sendable {
     public func manifestURL(for sessionID: SessionID) -> URL {
         sessionURL(for: sessionID).appendingPathComponent("manifest.json", isDirectory: false)
     }
+
+    public func postClassTranscriptsURL(for sessionID: SessionID) -> URL {
+        sessionURL(for: sessionID).appendingPathComponent(
+            "post-class-transcripts",
+            isDirectory: true
+        )
+    }
 }
 
 private struct ActiveChunk {
@@ -361,6 +368,41 @@ public actor SessionStorage {
             throw SessionStorageError.manifestMismatch
         }
         return candidate
+    }
+
+    @discardableResult
+    public func savePostClassTranscript(_ document: PostClassTranscriptDocument) throws -> URL {
+        guard document.version == PostClassTranscriptDocument.currentVersion else {
+            throw SessionStorageError.fileOperationFailed
+        }
+        let directory = layout.postClassTranscriptsURL(for: document.sessionID)
+        let filename = "\(Int(document.generatedAt.timeIntervalSince1970))-\(document.id.uuidString).json"
+        let destination = directory.appendingPathComponent(filename, isDirectory: false)
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try encoder.encode(document).write(to: destination, options: .atomic)
+            return destination
+        } catch {
+            throw SessionStorageError.fileOperationFailed
+        }
+    }
+
+    public func postClassTranscripts(
+        sessionID: SessionID
+    ) throws -> [PostClassTranscriptDocument] {
+        let directory = layout.postClassTranscriptsURL(for: sessionID)
+        guard fileManager.fileExists(atPath: directory.path) else { return [] }
+        do {
+            return try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )
+            .filter { $0.pathExtension == "json" }
+            .map { try decoder.decode(PostClassTranscriptDocument.self, from: Data(contentsOf: $0)) }
+            .sorted { $0.generatedAt > $1.generatedAt }
+        } catch {
+            throw SessionStorageError.fileOperationFailed
+        }
     }
 
     private func validate(_ manifest: SessionManifest) throws {

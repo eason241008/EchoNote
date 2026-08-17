@@ -8,6 +8,7 @@ public final class ProductionRuntime: ObservableObject {
     public let library: LectureLibraryModel
     public let settings: RuntimeSettingsModel
     public let speechModel: SpeechModelManager
+    public let captureService: ProductionLectureCaptureService
     public let translationProvider: AppleTranslationProvider
     public let modelsRootURL: URL
     public let applicationSupportURL: URL
@@ -50,17 +51,16 @@ public final class ProductionRuntime: ObservableObject {
         )
 
         let storage = SessionStorage(rootURL: sessionsURL)
-        let modelFolder = modelsURL.appendingPathComponent(
-            "openai_whisper-\(SpeechModelDescriptor.smallEnglish.id)",
-            isDirectory: true
-        )
         let capture = ProductionLectureCaptureService(
             storage: storage,
             database: database,
-            modelFolder: modelFolder,
+            modelFolderProvider: {
+                speechModelManager.readyModelFolder
+            },
             captionWorkspace: captionWorkspace,
             translationProvider: translationProvider
         )
+        captureService = capture
         let services = ApplicationServices(
             scheduling: EmptyCourseSchedulingService(),
             capture: capture,

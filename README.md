@@ -78,7 +78,7 @@ Fast English lectures are difficult to follow when listening, translating, and t
 | Hardware | Apple Silicon recommended |
 | Xcode | 16.0 or newer |
 | Swift | 5.9 toolchain or newer |
-| Disk | About 500 MB for the default `Whisper small.en` model, plus recordings |
+| Disk | About 626 MB for the compressed WhisperKit large-v3 model, plus recordings |
 | Network | Initial dependency/model download, Apple language download, and ICS sync |
 
 EchoNote uses Apple's on-device Translation framework for English-to-Simplified-Chinese captions. Translation content stays on the Mac; the system may ask before downloading the required language models.
@@ -96,7 +96,7 @@ swift test
 swift run EchoNote
 ```
 
-The first production recording also needs the `Whisper small.en` Core ML model. In the app, open **Settings → Local model** and download it. The model is validated before recording is enabled.
+The first production recording also needs the compressed `large-v3-v20240930_626MB` Core ML model. In the app, open **Settings → Local model** and download it. The model is validated before recording is enabled.
 
 ### Build a macOS app bundle
 
@@ -116,15 +116,15 @@ On first use:
 1. Allow microphone access when macOS asks.
 2. Select an available input device.
 3. Read and acknowledge the recording policy.
-4. Start a prepared lecture session explicitly.
+4. Select the current class from the timetable and start its prepared recording explicitly.
 
 EchoNote never starts recording merely because the app launches or a scheduled class begins.
 
 ### 2. Local speech model
 
-The current production pipeline uses English-only `Whisper small.en`:
+The current production pipeline uses the multilingual, compressed WhisperKit large-v3 model. Recognition is configured for English lectures; the downstream Simplified Chinese translation remains local to macOS because Whisper's translation task can only target English:
 
-- Estimated download: approximately 500 MB.
+- Estimated download: approximately 626 MB.
 - Inference: local Core ML through WhisperKit.
 - Model storage: `~/Library/Application Support/EchoNote/Models/`.
 - Recording is blocked until model validation succeeds.
@@ -159,6 +159,8 @@ EchoNote stores the API key in macOS Keychain and calls `<baseUrl>/chat/completi
 
 In **Settings → Timetable subscription**, paste your own HTTPS ICS URL and choose **Save and sync**. You can also import a local `.ics` file from the timetable page.
 
+Select a timetable block to prepare its recording. EchoNote reads the subject code and activity from the Melbourne timetable metadata, numbers repeated classes by teaching week, and creates names such as `第2周 · 90016 · Tutorial1`. Scheduled recordings stop automatically five minutes after the class end time, including while manually paused.
+
 Subscription URLs can contain private tokens. They remain in local UserDefaults and are not part of this repository.
 
 ## Data and Privacy
@@ -180,13 +182,15 @@ If an older local build used `~/Library/Application Support/课堂伴侣/`, Echo
 flowchart LR
     Mic[Microphone] --> Capture[AVAudioEngine capture]
     Capture --> Audio[Local session audio]
-    Capture --> Whisper[WhisperKit small.en]
+    Capture --> Whisper[WhisperKit large-v3 626 MB]
     Whisper --> Revision[Transcript revisions]
     Revision --> Search[SQLite full-text search]
     Revision --> Translate[Optional translation provider]
     Translate --> Library[Lecture library]
     Revision --> Library
     ICS[ICS file or subscription] --> Schedule[Weekly timetable]
+    Schedule --> Session[Week-numbered lecture session]
+    Session --> Capture
     Library --> Export[MD / SRT / JSON / PDF]
 ```
 

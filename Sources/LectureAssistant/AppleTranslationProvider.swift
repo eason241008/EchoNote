@@ -71,16 +71,18 @@ public actor AppleTranslationProvider: SimplifiedChineseTranslationProviding {
         let continuation: CheckedContinuation<SimplifiedChineseTranslationResponse, Error>
     }
 
-    private let jobStream: AsyncStream<Job>
-    private let jobContinuation: AsyncStream<Job>.Continuation
+    private let jobWakeStream: AsyncStream<Void>
+    private let jobWakeContinuation: AsyncStream<Void>.Continuation
     private let stateStream: BoundedAsyncStream<AppleTranslationServiceState>
     public nonisolated let states: AsyncStream<AppleTranslationServiceState>
+    private var jobs: [Job] = []
+    private var activeRunnerID: UUID?
     private var failure: Error?
 
     public init() {
-        let stream = AsyncStream.makeStream(of: Job.self)
-        jobStream = stream.stream
-        jobContinuation = stream.continuation
+        let stream = AsyncStream.makeStream(of: Void.self)
+        jobWakeStream = stream.stream
+        jobWakeContinuation = stream.continuation
         let stateStream = BoundedAsyncStream<AppleTranslationServiceState>(limit: 8)
         self.stateStream = stateStream
         states = stateStream.stream
@@ -92,35 +94,66 @@ public actor AppleTranslationProvider: SimplifiedChineseTranslationProviding {
     ) async throws -> SimplifiedChineseTranslationResponse {
         if let failure { throw failure }
         return try await withCheckedThrowingContinuation { continuation in
-            jobContinuation.yield(Job(request: request, continuation: continuation))
+            jobs.append(Job(request: request, continuation: continuation))
+            jobWakeContinuation.yield(())
         }
     }
 
+    public func needsRunnerRestart() -> Bool {
+        !jobs.isEmpty && activeRunnerID == nil
+    }
+
     public func run(session: any AppleTranslationSessionServing) async {
+        let runnerID = UUID()
+        activeRunnerID = runnerID
         failure = nil
         stateStream.yield(.preparing)
         do {
             try await session.prepareTranslation()
+            guard activeRunnerID == runnerID, !Task.isCancelled else {
+                deactivateRunner(runnerID)
+                return
+            }
             stateStream.yield(.ready)
-            for await job in jobStream {
-                guard !Task.isCancelled else {
-                    job.continuation.resume(throwing: CancellationError())
-                    break
+            var wakeIterator = jobWakeStream.makeAsyncIterator()
+            while activeRunnerID == runnerID, !Task.isCancelled {
+                guard !jobs.isEmpty else {
+                    guard await wakeIterator.next() != nil else { break }
+                    continue
                 }
+                let job = jobs.removeFirst()
                 do {
-                    job.continuation.resume(returning: try await translate(job.request, using: session))
+                    let response = try await translate(job.request, using: session)
+                    job.continuation.resume(returning: response)
+                } catch is CancellationError {
+                    jobs.insert(job, at: 0)
+                    break
                 } catch {
                     job.continuation.resume(throwing: error)
                 }
             }
+            deactivateRunner(runnerID)
         } catch is CancellationError {
+            deactivateRunner(runnerID)
             return
         } catch {
+            guard activeRunnerID == runnerID else { return }
             failure = error
             stateStream.yield(.unavailable(error.localizedDescription))
-            for await job in jobStream {
+            activeRunnerID = nil
+            let queuedJobs = jobs
+            jobs.removeAll(keepingCapacity: true)
+            for job in queuedJobs {
                 job.continuation.resume(throwing: error)
             }
+        }
+    }
+
+    private func deactivateRunner(_ runnerID: UUID) {
+        guard activeRunnerID == runnerID else { return }
+        activeRunnerID = nil
+        if !jobs.isEmpty {
+            stateStream.yield(.preparing)
         }
     }
 

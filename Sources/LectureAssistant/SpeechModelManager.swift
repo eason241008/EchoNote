@@ -7,11 +7,11 @@ public struct SpeechModelDescriptor: Equatable, Sendable {
     public let estimatedDownloadBytes: Int64
     public let requiredFreeBytes: Int64
 
-    public static let smallEnglish = SpeechModelDescriptor(
-        id: "small.en",
-        displayName: "Whisper small.en",
-        estimatedDownloadBytes: 500_000_000,
-        requiredFreeBytes: 1_000_000_000
+    public static let largeV3Compressed = SpeechModelDescriptor(
+        id: "large-v3-v20240930_626MB",
+        displayName: "WhisperKit large-v3 · 626 MB",
+        estimatedDownloadBytes: 626_000_000,
+        requiredFreeBytes: 2_000_000_000
     )
 }
 
@@ -58,7 +58,7 @@ public struct WhisperKitModelValidator: SpeechModelValidating {
 
     public func validate(modelFolder: URL) async throws {
         let config = WhisperKitConfig(
-            model: SpeechModelDescriptor.smallEnglish.id,
+            model: SpeechModelDescriptor.largeV3Compressed.id,
             modelFolder: modelFolder.path,
             verbose: false,
             prewarm: false,
@@ -97,7 +97,7 @@ public final class SpeechModelManager: ObservableObject {
     private let fileManager: FileManager
 
     public init(
-        descriptor: SpeechModelDescriptor = .smallEnglish,
+        descriptor: SpeechModelDescriptor = .largeV3Compressed,
         modelsRootURL: URL,
         downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
         validator: any SpeechModelValidating = WhisperKitModelValidator(),
@@ -108,14 +108,23 @@ public final class SpeechModelManager: ObservableObject {
         self.downloader = downloader
         self.validator = validator
         self.fileManager = fileManager
-        let installedURL = modelsRootURL.appendingPathComponent("openai_whisper-\(descriptor.id)")
-        state = fileManager.fileExists(atPath: installedURL.path) ? .verifying : .notInstalled
+        state = Self.installedModelFolders(
+            descriptor: descriptor,
+            modelsRootURL: modelsRootURL,
+            fileManager: fileManager
+        ).isEmpty ? .notInstalled : .verifying
     }
 
     public var isReady: Bool {
         if case .ready = state { return true }
         return false
     }
+
+    public var readyModelFolder: URL? {
+        guard case let .ready(modelFolder) = state else { return nil }
+        return modelFolder
+    }
+
     public var isBusy: Bool {
         switch state {
         case .downloading, .verifying: return true
@@ -192,6 +201,18 @@ public final class SpeechModelManager: ObservableObject {
     }
 
     private func installedCandidates() -> [URL] {
+        Self.installedModelFolders(
+            descriptor: descriptor,
+            modelsRootURL: modelsRootURL,
+            fileManager: fileManager
+        )
+    }
+
+    static func installedModelFolders(
+        descriptor: SpeechModelDescriptor = .largeV3Compressed,
+        modelsRootURL: URL,
+        fileManager: FileManager = .default
+    ) -> [URL] {
         guard let enumerator = fileManager.enumerator(
             at: modelsRootURL,
             includingPropertiesForKeys: [.isDirectoryKey],

@@ -11,11 +11,16 @@ private actor StubSpeechRecognizer: LocalSpeechRecognizing {
         case failure
     }
     var behavior: Behavior
+    let delay: Duration?
     private(set) var prompts: [String?] = []
 
-    init(behavior: Behavior) { self.behavior = behavior }
+    init(behavior: Behavior, delay: Duration? = nil) {
+        self.behavior = behavior
+        self.delay = delay
+    }
 
     func transcribe(samples: [Float], prompt: String?) async throws -> [SpeechRecognitionOutput] {
+        if let delay { try? await Task.sleep(for: delay) }
         prompts.append(prompt)
         switch behavior {
         case let .output(text):
@@ -73,17 +78,11 @@ final class LiveTranscriptionTests: XCTestCase {
     }
 
     func testPromptAcceptsEnglishTerminologyAndRejectsChineseCourseTitle() async throws {
-        let fixture = try await makeFixture()
-        await fixture.pipeline.updatePrompt("今天的课程")
-        await fixture.pipeline.consume(try frame(samples: 16_000))
-        let rejectedPrompt = await fixture.recognizer.latestPrompt()
-        XCTAssertNil(rejectedPrompt)
-
-        await fixture.pipeline.updatePrompt("machine learning")
-        await fixture.pipeline.consume(try frame(samples: 16_000))
-        let acceptedPrompt = await fixture.recognizer.latestPrompt()
-        XCTAssertEqual(acceptedPrompt, "machine learning")
-        await fixture.pipeline.finish()
+        XCTAssertNil(LiveTranscriptionPipeline.englishPrompt(from: "今天的课程"))
+        XCTAssertEqual(
+            LiveTranscriptionPipeline.englishPrompt(from: "machine learning"),
+            "machine learning"
+        )
     }
 
     func testEmptyRecognitionIsTreatedAsSilenceInsteadOfMissingAudio() async throws {
@@ -125,6 +124,24 @@ final class LiveTranscriptionTests: XCTestCase {
         XCTAssertEqual(finalized[0].end, 3.2)
     }
 
+    func testParagraphsContainAtMostTwoSentences() {
+        let outputs = [SpeechRecognitionOutput(
+            text: "First sentence. Second sentence. Third sentence! Fourth sentence? Fifth sentence.",
+            start: 0,
+            end: 10
+        )]
+
+        let paragraphs = LiveTranscriptionPipeline.paragraphOutputs(outputs)
+
+        XCTAssertEqual(paragraphs.map(\.text), [
+            "First sentence. Second sentence.",
+            "Third sentence! Fourth sentence?",
+            "Fifth sentence.",
+        ])
+        XCTAssertEqual(paragraphs.first?.start, 0)
+        XCTAssertEqual(paragraphs.last?.end, 10)
+    }
+
     func testRecognitionFailureCreatesExplicitGapRevision() async throws {
         let fixture = try await makeFixture(behavior: .failure)
         let collector = Task { () -> [LiveTranscriptSegment] in
@@ -145,6 +162,32 @@ final class LiveTranscriptionTests: XCTestCase {
         XCTAssertGreaterThan(stored[0].end, stored[0].start)
     }
 
+    func testSlowRecognitionDoesNotBlockAudioIngestionOrLoseFinalWindows() async throws {
+        let fixture = try await makeFixture(delay: .milliseconds(250))
+        let collector = Task { () -> [LiveTranscriptSegment] in
+            var values: [LiveTranscriptSegment] = []
+            for await segment in fixture.pipeline.segments where segment.isFinal {
+                values.append(segment)
+            }
+            return values
+        }
+        let startedAt = ContinuousClock.now
+
+        for _ in 0..<4 {
+            await fixture.pipeline.consume(try frame(samples: 16_000))
+        }
+        let ingestionDuration = startedAt.duration(to: .now)
+        let ingestionSeconds = Double(ingestionDuration.components.seconds)
+            + Double(ingestionDuration.components.attoseconds) / 1e18
+        await fixture.pipeline.finish()
+        let finalized = await collector.value
+
+        XCTAssertLessThan(ingestionSeconds, 0.5)
+        XCTAssertEqual(finalized.count, 2)
+        XCTAssertEqual(finalized.map(\.start), [0, 2])
+        XCTAssertEqual(finalized.map(\.end), [2, 4])
+    }
+
     private func frame(samples: Int) throws -> CapturedAudioFrame {
         let format = try XCTUnwrap(
             AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)
@@ -162,7 +205,8 @@ final class LiveTranscriptionTests: XCTestCase {
     }
 
     private func makeFixture(
-        behavior: StubSpeechRecognizer.Behavior = .output("recognized lecture")
+        behavior: StubSpeechRecognizer.Behavior = .output("recognized lecture"),
+        delay: Duration? = nil
     ) async throws -> (
         pipeline: LiveTranscriptionPipeline,
         recognizer: StubSpeechRecognizer,
@@ -183,7 +227,7 @@ final class LiveTranscriptionTests: XCTestCase {
             try SQLiteLectureSessionRepository(database: database).save(session)
             return (database, SQLiteTranscriptRevisionRepository(database: database), session)
         }
-        let recognizer = StubSpeechRecognizer(behavior: behavior)
+        let recognizer = StubSpeechRecognizer(behavior: behavior, delay: delay)
         let pipeline = LiveTranscriptionPipeline(
             sessionID: setup.2.id,
             recognizer: recognizer,

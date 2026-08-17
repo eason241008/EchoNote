@@ -5,6 +5,8 @@ import XCTest
 private actor RecordingGateCaptureSpy: LectureCaptureService {
     private var preparedSessionIDs: [SessionID] = []
     private var startCount = 0
+    private var pauseCount = 0
+    private var stopCount = 0
 
     func prepare(_ preparation: LectureCapturePreparation) async throws {
         preparedSessionIDs.append(preparation.session.id)
@@ -14,12 +16,17 @@ private actor RecordingGateCaptureSpy: LectureCaptureService {
         startCount += 1
     }
 
-    func pause() async throws {}
+    func pause() async throws { pauseCount += 1 }
     func resume() async throws {}
-    func stop() async throws {}
+    func stop() async throws { stopCount += 1 }
 
-    func invocations() -> (preparedSessionIDs: [SessionID], startCount: Int) {
-        (preparedSessionIDs, startCount)
+    func invocations() -> (
+        preparedSessionIDs: [SessionID],
+        startCount: Int,
+        pauseCount: Int,
+        stopCount: Int
+    ) {
+        (preparedSessionIDs, startCount, pauseCount, stopCount)
     }
 }
 
@@ -105,6 +112,27 @@ final class RecordingStartGateTests: XCTestCase {
     }
 
     @MainActor
+    func testScheduledRecordingStopsFiveMinutesAfterClassEvenWhenPaused() async throws {
+        let fixture = makeFixture(automaticStopGracePeriod: 0.05)
+        fixture.model.prepareSession(
+            title: "第2周 · 90016 · Tutorial1",
+            scheduledEndAt: Date()
+        )
+        try fixture.model.acknowledgeRecordingPolicy()
+        fixture.model.updateCapturePreflight(readyPreflight())
+
+        try await fixture.model.startRecording()
+        try await fixture.model.pauseRecording()
+        try await Task.sleep(for: .milliseconds(150))
+
+        let invocations = await fixture.capture.invocations()
+        XCTAssertEqual(invocations.pauseCount, 1)
+        XCTAssertEqual(invocations.stopCount, 1)
+        XCTAssertEqual(fixture.model.activeSession?.state, .completed)
+        XCTAssertNil(fixture.model.automaticStopAt)
+    }
+
+    @MainActor
     func testStartRefreshesStalePreflightAfterModelBecomesReady() async throws {
         let defaultsName = UUID().uuidString
         let defaults = UserDefaults(suiteName: defaultsName)!
@@ -159,7 +187,7 @@ final class RecordingStartGateTests: XCTestCase {
     }
 
     @MainActor
-    private func makeFixture() -> (
+    private func makeFixture(automaticStopGracePeriod: TimeInterval = 300) -> (
         model: ApplicationModel,
         capture: RecordingGateCaptureSpy
     ) {
@@ -176,7 +204,14 @@ final class RecordingStartGateTests: XCTestCase {
             library: EmptyLectureLibraryService(),
             export: EmptyLectureExportService()
         )
-        return (ApplicationModel(services: services, defaults: defaults), capture)
+        return (
+            ApplicationModel(
+                services: services,
+                defaults: defaults,
+                automaticStopGracePeriod: automaticStopGracePeriod
+            ),
+            capture
+        )
     }
 
     private func readyPreflight() -> CapturePreflightResult {

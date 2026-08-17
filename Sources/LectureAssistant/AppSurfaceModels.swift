@@ -17,6 +17,7 @@ public final class LectureLibraryModel: ObservableObject {
     @Published public private(set) var sessions: [LibrarySessionSummary] = []
     @Published public private(set) var searchResults: [LectureSearchResult] = []
     @Published public private(set) var selectedSnapshot: LectureSnapshot?
+    @Published public private(set) var selectedPostClassTranscripts: [PostClassTranscriptDocument] = []
     @Published public private(set) var statusMessage: String?
     @Published public var selectedSessionID: SessionID? {
         didSet { loadSelectedSnapshot() }
@@ -24,11 +25,13 @@ public final class LectureLibraryModel: ObservableObject {
 
     private let database: LectureDatabase
     private let sessionRoot: URL
+    private let storage: SessionStorage
     private let exporter = LectureSnapshotExporter()
 
     public init(database: LectureDatabase, sessionRoot: URL) {
         self.database = database
         self.sessionRoot = sessionRoot
+        storage = SessionStorage(rootURL: sessionRoot)
         refresh()
     }
 
@@ -209,9 +212,18 @@ public final class LectureLibraryModel: ObservableObject {
     private func loadSelectedSnapshot() {
         guard let selectedSessionID else {
             selectedSnapshot = nil
+            selectedPostClassTranscripts = []
             return
         }
         selectedSnapshot = try? snapshot(sessionID: selectedSessionID)
+        selectedPostClassTranscripts = []
+        Task { [weak self, storage] in
+            let documents = (try? await storage.postClassTranscripts(
+                sessionID: selectedSessionID
+            )) ?? []
+            guard self?.selectedSessionID == selectedSessionID else { return }
+            self?.selectedPostClassTranscripts = documents
+        }
     }
 
     private func safeFilename(_ value: String) -> String {
@@ -268,9 +280,9 @@ public final class RuntimeSettingsModel: ObservableObject {
     }
 
     public func refresh() {
-        modelInstalled = FileManager.default.fileExists(
-            atPath: modelsRootURL.appendingPathComponent("openai_whisper-small.en").path
-        )
+        modelInstalled = !SpeechModelManager.installedModelFolders(
+            modelsRootURL: modelsRootURL
+        ).isEmpty
         modelSize = directorySize(modelsRootURL)
         storageSize = directorySize(applicationSupportURL)
     }

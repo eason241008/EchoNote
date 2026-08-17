@@ -7,13 +7,43 @@ public enum CaptionLanguageVisibility: String, CaseIterable, Codable, Sendable {
     case simplifiedChineseOnly
 }
 
+public enum CaptionPresentationMode: String, CaseIterable, Codable, Sendable {
+    case floatingWindow
+    case dynamicIsland
+}
+
 public struct CaptionDisplaySettings: Codable, Equatable, Sendable {
     public var languageVisibility: CaptionLanguageVisibility = .bilingual
+    public var presentationMode: CaptionPresentationMode = .floatingWindow
     public var textSize: Double = 32
     public var opacity: Double = 0.92
     public var positionX: Double = 80
     public var positionY: Double = 80
     public var isHidden = false
+
+    private enum CodingKeys: String, CodingKey {
+        case languageVisibility, presentationMode, textSize, opacity
+        case positionX, positionY, isHidden
+    }
+
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        languageVisibility = try values.decodeIfPresent(
+            CaptionLanguageVisibility.self,
+            forKey: .languageVisibility
+        ) ?? .bilingual
+        presentationMode = try values.decodeIfPresent(
+            CaptionPresentationMode.self,
+            forKey: .presentationMode
+        ) ?? .floatingWindow
+        textSize = try values.decodeIfPresent(Double.self, forKey: .textSize) ?? 32
+        opacity = try values.decodeIfPresent(Double.self, forKey: .opacity) ?? 0.92
+        positionX = try values.decodeIfPresent(Double.self, forKey: .positionX) ?? 80
+        positionY = try values.decodeIfPresent(Double.self, forKey: .positionY) ?? 80
+        isHidden = try values.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
+    }
 }
 
 @MainActor
@@ -21,6 +51,7 @@ public final class CaptionWorkspaceModel: ObservableObject {
     @Published public private(set) var captureState = "尚未录音"
     @Published public private(set) var transcriptionState = "正在检查本地模型"
     @Published public private(set) var translationState = "按需启用"
+    @Published public private(set) var postClassTranscriptionState = "等待课程结束"
     @Published public private(set) var segments: [LiveTranscriptSegment] = []
     @Published public private(set) var translations: [TranscriptRevisionID: String] = [:]
     @Published public var settings: CaptionDisplaySettings {
@@ -49,6 +80,9 @@ public final class CaptionWorkspaceModel: ObservableObject {
     public func updateCaptureState(_ state: String) { captureState = state }
     public func updateTranscriptionState(_ state: String) { transcriptionState = state }
     public func updateTranslationState(_ state: String) { translationState = state }
+    public func updatePostClassTranscriptionState(_ state: String) {
+        postClassTranscriptionState = state
+    }
 
     public func beginSession() {
         segments.removeAll(keepingCapacity: true)
@@ -56,6 +90,7 @@ public final class CaptionWorkspaceModel: ObservableObject {
         captureState = "准备录音"
         transcriptionState = "正在加载本地模型"
         translationState = "按需启用"
+        postClassTranscriptionState = "等待课程结束"
     }
 
     public func append(_ segment: LiveTranscriptSegment) {
@@ -79,6 +114,10 @@ public final class CaptionWorkspaceModel: ObservableObject {
 
     public func translation(for segment: LiveTranscriptSegment) -> String? {
         segment.revisionID.flatMap { translations[$0] }
+    }
+
+    public func recentSegments(limit: Int = 3) -> [LiveTranscriptSegment] {
+        Array(segments.suffix(max(1, limit)))
     }
 
     public func replaceText(segmentID: String, text: String) {
@@ -126,24 +165,20 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
         window?.contentView?.accessibilityLabel()
     }
     public var windowSize: NSSize? { window?.contentView?.bounds.size }
+    public var presentationMode: CaptionPresentationMode { model.settings.presentationMode }
+    var isContentScrolledToBottom: Bool? {
+        guard let contentView = window?.contentView,
+              let scrollView = firstScrollView(in: contentView),
+              let documentView = scrollView.documentView else { return nil }
+        let visibleBottom = scrollView.contentView.bounds.maxY
+        let documentBottom = documentView.bounds.maxY
+        return visibleBottom >= documentBottom - 2
+    }
 
     public func show() {
         if window == nil {
-            let proposed = NSRect(
-                x: model.settings.positionX,
-                y: model.settings.positionY,
-                width: 960,
-                height: 260
-            )
-            let visible = NSScreen.main?.visibleFrame ?? proposed
-            let contentRect = NSRect(
-                x: min(max(proposed.minX, visible.minX), max(visible.minX, visible.maxX - proposed.width)),
-                y: min(max(proposed.minY, visible.minY), max(visible.minY, visible.maxY - proposed.height)),
-                width: proposed.width,
-                height: proposed.height
-            )
             let panel = NSPanel(
-                contentRect: contentRect,
+                contentRect: frame(for: model.settings.presentationMode),
                 styleMask: [.titled, .nonactivatingPanel, .resizable],
                 backing: .buffered,
                 defer: false
@@ -153,25 +188,48 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
             panel.isMovableByWindowBackground = true
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
-            panel.backgroundColor = NSColor(
-                calibratedRed: 0.12,
-                green: 0.17,
-                blue: 0.16,
-                alpha: 0.96
-            )
+            panel.standardWindowButton(.closeButton)?.isHidden = true
+            panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+            panel.standardWindowButton(.zoomButton)?.isHidden = true
+            panel.backgroundColor = .clear
             panel.isOpaque = false
-            let hostingView = NSHostingView(rootView: CaptionOverlayView(model: model))
+            panel.hasShadow = true
+            panel.isReleasedWhenClosed = false
+            let hostingView = NSHostingView(rootView: CaptionOverlayView(
+                model: model,
+                hide: { [weak self] in self?.hide() },
+                close: { [weak self] in self?.close() }
+            ))
             hostingView.sizingOptions = []
             panel.contentView = hostingView
-            panel.setContentSize(NSSize(width: 960, height: 260))
-            panel.minSize = panel.frameRect(
-                forContentRect: NSRect(x: 0, y: 0, width: 760, height: 220)
-            ).size
             panel.delegate = self
             window = panel
         }
+        refreshPresentation()
         model.showOverlay()
         window?.orderFrontRegardless()
+    }
+
+    public func refreshPresentation() {
+        guard let panel = window else { return }
+        let target = frame(for: model.settings.presentationMode)
+        panel.styleMask = model.settings.presentationMode == .dynamicIsland
+            ? [.borderless, .nonactivatingPanel]
+            : [.titled, .nonactivatingPanel, .resizable]
+        panel.isMovableByWindowBackground = model.settings.presentationMode == .floatingWindow
+        panel.setContentSize(target.size)
+        panel.setFrameOrigin(target.origin)
+        let fixedFrameSize = panel.frameRect(
+            forContentRect: NSRect(origin: .zero, size: target.size)
+        ).size
+        panel.minSize = model.settings.presentationMode == .dynamicIsland
+            ? fixedFrameSize
+            : panel.frameRect(
+                forContentRect: NSRect(x: 0, y: 0, width: 760, height: 320)
+            ).size
+        panel.maxSize = model.settings.presentationMode == .dynamicIsland
+            ? fixedFrameSize
+            : NSSize(width: 1_600, height: 900)
     }
 
     func snapshotPNG() -> Data? {
@@ -186,12 +244,21 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
         model.quickHide()
         window?.orderOut(nil)
     }
+
+    public func close() {
+        model.quickHide()
+        window?.close()
+        window = nil
+    }
     public func windowWillResize(
         _ sender: NSWindow,
         to frameSize: NSSize
     ) -> NSSize {
+        if model.settings.presentationMode == .dynamicIsland {
+            return frame(for: .dynamicIsland).size
+        }
         let minimumFrame = sender.frameRect(
-            forContentRect: NSRect(x: 0, y: 0, width: 760, height: 220)
+            forContentRect: NSRect(x: 0, y: 0, width: 760, height: 320)
         ).size
         return NSSize(
             width: max(frameSize.width, minimumFrame.width),
@@ -204,18 +271,120 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
     }
 
     public func windowDidMove(_ notification: Notification) {
+        guard model.settings.presentationMode == .floatingWindow else { return }
         guard let frame = window?.frame else { return }
         model.updateOverlayPosition(x: frame.minX, y: frame.minY)
+    }
+
+
+    private func frame(for mode: CaptionPresentationMode) -> NSRect {
+        let size = mode == .dynamicIsland
+            ? NSSize(width: 720, height: 280)
+            : NSSize(width: 960, height: 390)
+        let fallback = NSRect(
+            x: model.settings.positionX,
+            y: model.settings.positionY,
+            width: size.width,
+            height: size.height
+        )
+        let visible = NSScreen.main?.visibleFrame ?? fallback
+        if mode == .dynamicIsland {
+            return NSRect(
+                x: visible.midX - size.width / 2,
+                y: visible.maxY - size.height - 8,
+                width: size.width,
+                height: size.height
+            )
+        }
+        return NSRect(
+            x: min(max(model.settings.positionX, visible.minX), max(visible.minX, visible.maxX - size.width)),
+            y: min(max(model.settings.positionY, visible.minY), max(visible.minY, visible.maxY - size.height)),
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    private func firstScrollView(in view: NSView) -> NSScrollView? {
+        if let scrollView = view as? NSScrollView { return scrollView }
+        for child in view.subviews {
+            if let match = firstScrollView(in: child) { return match }
+        }
+        return nil
     }
 }
 
 private struct CaptionOverlayView: View {
     @ObservedObject var model: CaptionWorkspaceModel
+    let hide: () -> Void
+    let close: () -> Void
+
+    private var isDynamicIsland: Bool {
+        model.settings.presentationMode == .dynamicIsland
+    }
+
+    private var visibleSegments: [LiveTranscriptSegment] {
+        model.recentSegments(limit: isDynamicIsland ? 2 : 3)
+    }
+
+    private var latestUpdateToken: String {
+        guard let segment = model.segments.last else { return "empty" }
+        return [
+            segment.id,
+            segment.text,
+            model.translation(for: segment) ?? "",
+        ].joined(separator: "|")
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            ForEach(model.segments.suffix(1), id: \.id) { segment in
-                CaptionSegmentText(model: model, segment: segment)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Label(
+                    isDynamicIsland ? "灵动岛字幕" : "实时字幕",
+                    systemImage: "captions.bubble.fill"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: hide) {
+                    Image(systemName: "minus")
+                        .frame(width: 24, height: 20)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("隐藏字幕浮窗")
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .frame(width: 24, height: 20)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭字幕浮窗")
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            ScrollViewReader { proxy in
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(visibleSegments, id: \.id) { segment in
+                            CaptionSegmentText(
+                                model: model,
+                                segment: segment,
+                                fontSize: isDynamicIsland ? min(model.settings.textSize, 18) : nil,
+                                maximumLineCount: isDynamicIsland ? 2 : 4
+                            )
+                            .id(segment.id)
+                            if segment.id != visibleSegments.last?.id {
+                                Divider().opacity(0.35)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: .infinity)
+                .onAppear { scrollToLatest(using: proxy, animated: false) }
+                .onChange(of: latestUpdateToken) {
+                    scrollToLatest(using: proxy, animated: true)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("课堂实时双语字幕")
+                .accessibilityValue(model.segments.last?.text ?? "暂无字幕")
             }
             if model.segments.isEmpty {
                 Text("等待字幕…")
@@ -223,20 +392,51 @@ private struct CaptionOverlayView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .multilineTextAlignment(.leading)
-        .padding(.horizontal, 26)
-        .padding(.vertical, 22)
+        .padding(.horizontal, isDynamicIsland ? 22 : 26)
+        .padding(.vertical, isDynamicIsland ? 12 : 22)
+        .background(
+            RoundedRectangle(
+                cornerRadius: isDynamicIsland ? 32 : 20,
+                style: .continuous
+            )
+            .fill(Color.black.opacity(isDynamicIsland ? 0.94 : 0.82))
+        )
         .opacity(model.settings.opacity)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("课堂实时双语字幕")
-        .accessibilityValue(model.segments.last?.text ?? "暂无字幕")
+    }
+
+    private func scrollToLatest(using proxy: ScrollViewProxy, animated: Bool) {
+        guard let id = visibleSegments.last?.id else { return }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(id, anchor: .bottom)
+            }
+        }
     }
 }
 
 struct CaptionSegmentText: View {
     @ObservedObject var model: CaptionWorkspaceModel
     let segment: LiveTranscriptSegment
+    let fontSize: Double?
+    let maximumLineCount: Int
+
+    init(
+        model: CaptionWorkspaceModel,
+        segment: LiveTranscriptSegment,
+        fontSize: Double? = nil,
+        maximumLineCount: Int = 4
+    ) {
+        self.model = model
+        self.segment = segment
+        self.fontSize = fontSize
+        self.maximumLineCount = maximumLineCount
+    }
 
     var body: some View {
         if segment.isGap {
@@ -257,9 +457,9 @@ struct CaptionSegmentText: View {
                         .multilineTextAlignment(.leading)
                 }
             }
-            .font(.system(size: model.settings.textSize))
+            .font(.system(size: fontSize ?? model.settings.textSize))
             .foregroundStyle(.white)
-            .lineLimit(4)
+            .lineLimit(maximumLineCount)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

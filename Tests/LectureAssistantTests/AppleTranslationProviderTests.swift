@@ -35,7 +35,74 @@ private actor StubAppleTranslationSession: AppleTranslationSessionServing {
     func requests() -> [AppleTranslationRequest] { receivedRequests }
 }
 
+private actor BlockingAppleTranslationSession: AppleTranslationSessionServing {
+    private(set) var translationStarted = false
+
+    func prepareTranslation() async throws {}
+
+    func translations(
+        from requests: [AppleTranslationRequest]
+    ) async throws -> [AppleTranslationResult] {
+        translationStarted = true
+        try await Task.sleep(for: .seconds(30))
+        return []
+    }
+
+    func hasStartedTranslation() -> Bool { translationStarted }
+}
+
 final class AppleTranslationProviderTests: XCTestCase {
+    func testQueuedTranslationRequestsRunnerRestartAndDrainsWhenRunnerStarts() async throws {
+        let provider = AppleTranslationProvider()
+        let revisionID = TranscriptRevisionID()
+        let request = try SimplifiedChineseTranslationRequest(segments: [
+            TranslationSourceSegment(revisionID: revisionID, text: "Queued sentence"),
+        ])
+        let translationTask = Task { try await provider.translate(request) }
+
+        try await Task.sleep(for: .milliseconds(20))
+        let restartNeededBeforeRun = await provider.needsRunnerRestart()
+        XCTAssertTrue(restartNeededBeforeRun)
+
+        let runTask = Task { await provider.run(session: StubAppleTranslationSession()) }
+        let response = try await translationTask.value
+        runTask.cancel()
+
+        XCTAssertEqual(response.translations.first?.text, "中文：Queued sentence")
+        let restartNeededAfterRun = await provider.needsRunnerRestart()
+        XCTAssertFalse(restartNeededAfterRun)
+    }
+
+    func testCancelledRunnerRequeuesInFlightTranslationForReplacementRunner() async throws {
+        let provider = AppleTranslationProvider()
+        let blockedSession = BlockingAppleTranslationSession()
+        let runTask = Task { await provider.run(session: blockedSession) }
+        let revisionID = TranscriptRevisionID()
+        let request = try SimplifiedChineseTranslationRequest(segments: [
+            TranslationSourceSegment(revisionID: revisionID, text: "Recover me"),
+        ])
+        let translationTask = Task { try await provider.translate(request) }
+
+        for _ in 0..<100 {
+            if await blockedSession.hasStartedTranslation() { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let translationStarted = await blockedSession.hasStartedTranslation()
+        XCTAssertTrue(translationStarted)
+        runTask.cancel()
+        _ = await runTask.result
+
+        let restartNeeded = await provider.needsRunnerRestart()
+        XCTAssertTrue(restartNeeded)
+        let replacementTask = Task {
+            await provider.run(session: StubAppleTranslationSession())
+        }
+        let response = try await translationTask.value
+        replacementTask.cancel()
+
+        XCTAssertEqual(response.translations.first?.text, "中文：Recover me")
+    }
+
     func testUsesOnDeviceMetadataAndPreservesRevisionLinks() async throws {
         let provider = AppleTranslationProvider()
         let session = StubAppleTranslationSession()

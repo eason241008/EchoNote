@@ -5,7 +5,7 @@ import XCTest
 
 final class RealOfflineTranscriptionTests: XCTestCase {
     @MainActor
-    func testSmallEnglishTranscribesSynthesizedSpeechWithoutModelDownloadDuringInference() async throws {
+    func testLargeV3TranscribesSynthesizedSpeechWithoutModelDownloadDuringInference() async throws {
         guard ProcessInfo.processInfo.environment["LECTURE_ASSISTANT_REAL_TRANSCRIPTION"] == "1" else {
             throw XCTSkip("Set LECTURE_ASSISTANT_REAL_TRANSCRIPTION=1 to exercise offline WhisperKit inference.")
         }
@@ -43,6 +43,105 @@ final class RealOfflineTranscriptionTests: XCTestCase {
             transcript.contains("lecture") || transcript.contains("transcription"),
             "Unexpected transcript: \(transcript)"
         )
+    }
+
+    @MainActor
+    func testLargeV3TranscribesLocalEchoNoteRecording() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let audioPath = environment["LECTURE_ASSISTANT_LOCAL_AUDIO"],
+              let modelsRootPath = environment["LECTURE_ASSISTANT_LOCAL_MODELS_ROOT"] else {
+            throw XCTSkip(
+                "Set LECTURE_ASSISTANT_LOCAL_AUDIO and LECTURE_ASSISTANT_LOCAL_MODELS_ROOT to diagnose a local EchoNote recording."
+            )
+        }
+        let audioURL = URL(fileURLWithPath: audioPath)
+        let manager = SpeechModelManager(modelsRootURL: URL(fileURLWithPath: modelsRootPath))
+        await manager.refresh()
+        let modelFolder = try XCTUnwrap(
+            manager.readyModelFolder,
+            "The local large-v3 model must already be installed and validated."
+        )
+        let samples = try loadMonoSamples16k(from: audioURL)
+        let audioDuration = Double(samples.count) / 16_000
+        let recognizer = try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
+        let startedAt = ContinuousClock.now
+        let windowSeconds = Double(environment["LECTURE_ASSISTANT_LOCAL_WINDOW_SECONDS"] ?? "0") ?? 0
+        let windowSamples = windowSeconds > 0 ? Int(windowSeconds * 16_000) : samples.count
+        var outputs: [SpeechRecognitionOutput] = []
+        var offset = 0
+        while offset < samples.count {
+            let end = min(samples.count, offset + windowSamples)
+            let windowOutputs = try await recognizer.transcribe(
+                samples: Array(samples[offset..<end]),
+                prompt: nil
+            )
+            let windowOffset = Double(offset) / 16_000
+            outputs.append(contentsOf: windowOutputs.map {
+                SpeechRecognitionOutput(
+                    text: $0.text,
+                    start: windowOffset + $0.start,
+                    end: windowOffset + $0.end
+                )
+            })
+            offset = end
+        }
+
+        let elapsed = startedAt.duration(to: .now)
+        let elapsedSeconds = Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1e18
+        let transcript = outputs.map(\.text).joined(separator: " ")
+        print(
+            "LOCAL_RECORDING_RESULT duration=\(audioDuration) window=\(windowSeconds) latency=\(elapsedSeconds) rtf=\(elapsedSeconds / audioDuration) transcript=\(transcript)"
+        )
+        XCTAssertFalse(transcript.isEmpty)
+    }
+
+    @MainActor
+    func testLivePipelineCoversLocalEchoNoteRecordingWithoutDroppingWindows() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let audioPath = environment["LECTURE_ASSISTANT_LOCAL_AUDIO"],
+              let modelsRootPath = environment["LECTURE_ASSISTANT_LOCAL_MODELS_ROOT"] else {
+            throw XCTSkip(
+                "Set LECTURE_ASSISTANT_LOCAL_AUDIO and LECTURE_ASSISTANT_LOCAL_MODELS_ROOT to diagnose the live pipeline."
+            )
+        }
+        let manager = SpeechModelManager(
+            modelsRootURL: URL(fileURLWithPath: modelsRootPath)
+        )
+        await manager.refresh()
+        let modelFolder = try XCTUnwrap(manager.readyModelFolder)
+        let samples = try loadMonoSamples16k(from: URL(fileURLWithPath: audioPath))
+        let recognizer = try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
+        let pipeline = LiveTranscriptionPipeline(
+            sessionID: SessionID(),
+            recognizer: recognizer,
+            finalWindowSeconds: 30,
+            partialWindowSeconds: 5
+        )
+        let collector = Task { () -> [LiveTranscriptSegment] in
+            var values: [LiveTranscriptSegment] = []
+            for await segment in pipeline.segments where segment.isFinal {
+                values.append(segment)
+            }
+            return values
+        }
+        let frameSamples = 2_048
+        var offset = 0
+        while offset < samples.count {
+            let end = min(samples.count, offset + frameSamples)
+            await pipeline.consume(try makeFrame(samples: Array(samples[offset..<end])))
+            offset = end
+        }
+        await pipeline.finish()
+        let finalized = await collector.value
+        let transcript = finalized.map(\.text).joined(separator: " ")
+        let expectedWindows = Int(ceil(Double(samples.count) / (30 * 16_000)))
+        print(
+            "LOCAL_LIVE_PIPELINE_RESULT paragraphs=\(finalized.count) minimum_windows=\(expectedWindows) words=\(transcript.split(whereSeparator: \.isWhitespace).count) transcript=\(transcript)"
+        )
+
+        XCTAssertGreaterThanOrEqual(finalized.count, expectedWindows)
+        XCTAssertGreaterThan(transcript.split(whereSeparator: \.isWhitespace).count, 50)
     }
 
     private func synthesizeSpeech(_ text: String, to url: URL) throws {
@@ -87,5 +186,32 @@ final class RealOfflineTranscriptionTests: XCTestCase {
         XCTAssertNil(conversionError)
         let channel = try XCTUnwrap(output.floatChannelData?[0])
         return Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
+    }
+
+    private func makeFrame(samples: [Float]) throws -> CapturedAudioFrame {
+        let format = try XCTUnwrap(
+            AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: false
+            )
+        )
+        let buffer = try XCTUnwrap(
+            AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(samples.count)
+            )
+        )
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        let channel = try XCTUnwrap(buffer.floatChannelData?[0])
+        samples.withUnsafeBufferPointer { source in
+            channel.update(from: source.baseAddress!, count: samples.count)
+        }
+        return CapturedAudioFrame(
+            buffer: buffer,
+            capturedAt: .now,
+            activity: AudioActivityMeter.measure(buffer: buffer)
+        )
     }
 }

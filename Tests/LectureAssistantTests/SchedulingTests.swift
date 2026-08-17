@@ -5,7 +5,7 @@ import XCTest
 @MainActor
 final class SchedulingTests: XCTestCase {
     func testRecurringICSExpandsAndPreservesUID() throws {
-        let contents = """
+        let contents = #"""
         BEGIN:VCALENDAR
         VERSION:2.0
         BEGIN:VEVENT
@@ -17,7 +17,7 @@ final class SchedulingTests: XCTestCase {
         RRULE:FREQ=WEEKLY;COUNT=3
         END:VEVENT
         END:VCALENDAR
-        """
+        """#
 
         let events = try ICSParser().parse(contents)
 
@@ -45,6 +45,44 @@ final class SchedulingTests: XCTestCase {
         let components = calendar.dateComponents([.hour, .minute], from: event.startsAt)
         XCTAssertEqual(components.hour, 14)
         XCTAssertEqual(components.minute, 0)
+    }
+
+    func testMelbourneCalendarMetadataBuildsWeekBasedRecordingTitle() throws {
+        let contents = #"""
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        BEGIN:VEVENT
+        UID:week-1
+        DTSTART;TZID=Australia/Melbourne:20260728T160000
+        DTEND;TZID=Australia/Melbourne:20260728T173000
+        SUMMARY:Software Processes and Management\, Tutorial1
+        DESCRIPTION:SWEN90016_U_1_SM2\, Tutorial1\, 2
+        END:VEVENT
+        BEGIN:VEVENT
+        UID:week-2
+        DTSTART;TZID=Australia/Melbourne:20260804T160000
+        DTEND;TZID=Australia/Melbourne:20260804T173000
+        SUMMARY:Software Processes and Management\, Tutorial1
+        DESCRIPTION:SWEN90016_U_1_SM2\, Tutorial1\, 2
+        END:VEVENT
+        END:VCALENDAR
+        """#
+        let defaults = UserDefaults(suiteName: #function)!
+        defaults.removePersistentDomain(forName: #function)
+        let store = TimetableStore(defaults: defaults)
+        try store.importCalendar(contents)
+
+        let event = try XCTUnwrap(store.events.last)
+        let context = try XCTUnwrap(store.recordingContext(for: event))
+
+        XCTAssertEqual(event.courseCode, "SWEN90016")
+        XCTAssertEqual(event.activity, "Tutorial1")
+        XCTAssertEqual(context.weekNumber, 2)
+        XCTAssertEqual(context.title, "第2周 · 90016 · Tutorial1")
+        XCTAssertEqual(
+            store.recordingContext(at: event.startsAt.addingTimeInterval(60))?.event,
+            event
+        )
     }
 
     func testInvalidICSReportsUserSafeError() {

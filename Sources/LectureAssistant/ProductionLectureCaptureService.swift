@@ -2,9 +2,14 @@ import Foundation
 
 @MainActor
 public final class ProductionLectureCaptureService: LectureCaptureService, @unchecked Sendable {
+    private struct PostClassJob: Equatable, Sendable {
+        let sessionID: SessionID
+        let title: String
+    }
+
     private let storage: SessionStorage
     private let database: LectureDatabase
-    private let modelFolder: URL
+    private let modelFolderProvider: () -> URL?
     private let captionWorkspace: CaptionWorkspaceModel
     private let translationProvider: any SimplifiedChineseTranslationProviding
 
@@ -15,7 +20,15 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
     private var segmentTask: Task<Void, Never>?
     private var translationStateTask: Task<Void, Never>?
     private var translationResultTask: Task<Void, Never>?
+    private var postClassTask: Task<Void, Never>?
+    private var postClassTaskToken: UUID?
+    private var pendingPostClassJobs: [PostClassJob] = []
+    private var postClassPausedForRecording = false
     private var currentPreparation: LectureCapturePreparation?
+    private var cachedRecognizer: WhisperKitSpeechRecognizer?
+    private var cachedModelFolder: URL?
+    private var recognizerLoadTask: Task<WhisperKitSpeechRecognizer, Error>?
+    private var recognizerLoadFolder: URL?
 
     public init(
         storage: SessionStorage,
@@ -26,12 +39,30 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
     ) {
         self.storage = storage
         self.database = database
-        self.modelFolder = modelFolder
+        modelFolderProvider = { modelFolder }
+        self.captionWorkspace = captionWorkspace
+        self.translationProvider = translationProvider
+    }
+
+    public init(
+        storage: SessionStorage,
+        database: LectureDatabase,
+        modelFolderProvider: @escaping () -> URL?,
+        captionWorkspace: CaptionWorkspaceModel,
+        translationProvider: any SimplifiedChineseTranslationProviding
+    ) {
+        self.storage = storage
+        self.database = database
+        self.modelFolderProvider = modelFolderProvider
         self.captionWorkspace = captionWorkspace
         self.translationProvider = translationProvider
     }
 
     public func prepare(_ preparation: LectureCapturePreparation) async throws {
+        postClassPausedForRecording = true
+        postClassTask?.cancel()
+        postClassTask = nil
+        postClassTaskToken = nil
         cancelTasks()
         currentPreparation = preparation
         captionWorkspace.beginSession()
@@ -41,17 +72,19 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
             state: .prepared,
             selectedDeviceID: String(preparation.deviceID),
             courseID: preparation.session.courseID,
-            transcriptionModel: SpeechModelDescriptor.smallEnglish.id
+            transcriptionModel: SpeechModelDescriptor.largeV3Compressed.id
         ))
 
         captionWorkspace.updateCaptureState("准备录音")
         captionWorkspace.updateTranscriptionState("正在加载本地模型")
-        let recognizer = try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
+        let recognizer = try await loadRecognizer()
         let transcriptRepository = SQLiteTranscriptRevisionRepository(database: database)
         let transcription = LiveTranscriptionPipeline(
             sessionID: preparation.session.id,
             recognizer: recognizer,
-            repository: transcriptRepository
+            repository: transcriptRepository,
+            finalWindowSeconds: 10,
+            partialWindowSeconds: 4
         )
         await transcription.updatePrompt(preparation.session.title)
         let translation = makeTranslationPipeline()
@@ -119,6 +152,10 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         }
     }
 
+    public func prewarmRecognizer() async throws {
+        _ = try await loadRecognizer()
+    }
+
     public func pause() async throws {
         try await capture?.pause()
         captionWorkspace.updateCaptureState("已暂停")
@@ -142,25 +179,132 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
     public func stop() async throws {
         guard let capture else { return }
         try await capture.stop()
+        _ = await frameTask?.result
         await transcription?.finish()
         _ = await segmentTask?.result
         await translation?.finish()
         _ = await translationStateTask?.result
         _ = await translationResultTask?.result
         captionWorkspace.updateCaptureState("已完成")
-        captionWorkspace.updateTranscriptionState("转写完成")
+        if capture.droppedFrameCount > 0 {
+            captionWorkspace.updateTranscriptionState(
+                "实时字幕缓冲溢出 \(capture.droppedFrameCount) 帧；原始音频已完整保存"
+            )
+        } else {
+            captionWorkspace.updateTranscriptionState("转写完成 · 音频零丢帧")
+        }
         if var session = currentPreparation?.session {
             session.state = .completed
             session.updatedAt = LectureTimestamp()
             try SQLiteLectureSessionRepository(database: database).save(session)
         }
+        postClassPausedForRecording = false
+        enqueuePostClassTranscription()
     }
 
     private func makeTranslationPipeline() -> TranslationPipeline {
         TranslationPipeline(
             provider: translationProvider,
-            repository: SQLiteTranslationRepository(database: database)
+            repository: SQLiteTranslationRepository(database: database),
+            batchingDelay: .milliseconds(80)
         )
+    }
+
+    private func loadRecognizer() async throws -> WhisperKitSpeechRecognizer {
+        guard let modelFolder = modelFolderProvider() else {
+            throw SpeechModelManagerError.invalidModelDirectory
+        }
+        if let cachedRecognizer, cachedModelFolder == modelFolder {
+            return cachedRecognizer
+        }
+        if let recognizerLoadTask, recognizerLoadFolder == modelFolder {
+            return try await recognizerLoadTask.value
+        }
+        let task = Task {
+            try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
+        }
+        recognizerLoadTask = task
+        recognizerLoadFolder = modelFolder
+        do {
+            let recognizer = try await task.value
+            cachedRecognizer = recognizer
+            cachedModelFolder = modelFolder
+            recognizerLoadTask = nil
+            recognizerLoadFolder = nil
+            return recognizer
+        } catch {
+            recognizerLoadTask = nil
+            recognizerLoadFolder = nil
+            throw error
+        }
+    }
+
+    private func enqueuePostClassTranscription() {
+        guard let session = currentPreparation?.session else { return }
+        let job = PostClassJob(sessionID: session.id, title: session.title)
+        if !pendingPostClassJobs.contains(job) {
+            pendingPostClassJobs.append(job)
+        }
+        startNextPostClassTranscriptionIfPossible()
+    }
+
+    private func startNextPostClassTranscriptionIfPossible() {
+        guard !postClassPausedForRecording,
+              postClassTask == nil,
+              let recognizer = cachedRecognizer,
+              let job = pendingPostClassJobs.first else { return }
+        captionWorkspace.updatePostClassTranscriptionState(
+            "正在后台生成课后整课校对稿：\(job.title)"
+        )
+        let service = PostClassTranscriptionService(
+            storage: storage,
+            recognizer: recognizer
+        )
+        let taskToken = UUID()
+        postClassTaskToken = taskToken
+        postClassTask = Task { [weak self] in
+            do {
+                let document = try await service.generate(
+                    sessionID: job.sessionID,
+                    title: job.title
+                )
+                guard !Task.isCancelled else { return }
+                self?.finishPostClassTranscription(
+                    job: job,
+                    taskToken: taskToken,
+                    message: "课后校对稿已保存：\(job.title)（\(document.segments.count) 段）"
+                )
+            } catch is CancellationError {
+                self?.handlePostClassCancellation(taskToken: taskToken)
+                return
+            } catch {
+                self?.finishPostClassTranscription(
+                    job: job,
+                    taskToken: taskToken,
+                    message: "课后校对稿生成失败（\(job.title)）：\(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func handlePostClassCancellation(taskToken: UUID) {
+        guard postClassTaskToken == taskToken else { return }
+        postClassTask = nil
+        postClassTaskToken = nil
+        startNextPostClassTranscriptionIfPossible()
+    }
+
+    private func finishPostClassTranscription(
+        job: PostClassJob,
+        taskToken: UUID,
+        message: String
+    ) {
+        guard postClassTaskToken == taskToken else { return }
+        pendingPostClassJobs.removeAll { $0.sessionID == job.sessionID }
+        captionWorkspace.updatePostClassTranscriptionState(message)
+        postClassTask = nil
+        postClassTaskToken = nil
+        startNextPostClassTranscriptionIfPossible()
     }
 
 

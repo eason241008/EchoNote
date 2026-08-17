@@ -56,6 +56,8 @@ public struct LectureSession: Codable, Hashable, Sendable {
     public let id: SessionID
     public var courseID: CourseID?
     public var title: String
+    public var scheduledEventID: String?
+    public var scheduledEndAt: LectureTimestamp?
     public var state: SessionState
     public var createdAt: LectureTimestamp
     public var updatedAt: LectureTimestamp
@@ -64,6 +66,8 @@ public struct LectureSession: Codable, Hashable, Sendable {
         id: SessionID = SessionID(),
         courseID: CourseID? = nil,
         title: String,
+        scheduledEventID: String? = nil,
+        scheduledEndAt: LectureTimestamp? = nil,
         state: SessionState = .prepared,
         createdAt: LectureTimestamp = LectureTimestamp(),
         updatedAt: LectureTimestamp = LectureTimestamp()
@@ -71,6 +75,8 @@ public struct LectureSession: Codable, Hashable, Sendable {
         self.id = id
         self.courseID = courseID
         self.title = title
+        self.scheduledEventID = scheduledEventID
+        self.scheduledEndAt = scheduledEndAt
         self.state = state
         self.createdAt = createdAt
         self.updatedAt = updatedAt

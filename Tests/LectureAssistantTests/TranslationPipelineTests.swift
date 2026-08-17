@@ -33,9 +33,33 @@ private actor StubTranslationProvider: SimplifiedChineseTranslationProviding {
     func clearError() { error = nil }
     func requestCount() -> Int { requests.count }
     func latestRequest() -> SimplifiedChineseTranslationRequest? { requests.last }
+    func allRequests() -> [SimplifiedChineseTranslationRequest] { requests }
 }
 
 final class TranslationPipelineTests: XCTestCase {
+    func testBacklogIsSplitIntoSmallProviderBatches() async throws {
+        let provider = StubTranslationProvider()
+        let pipeline = TranslationPipeline(
+            provider: provider,
+            batchingDelay: .milliseconds(10),
+            maximumBatchSize: 8
+        )
+
+        for index in 0..<20 {
+            await pipeline.enqueue(.init(
+                sessionID: SessionID(),
+                revisionID: TranscriptRevisionID(),
+                text: "Sentence \(index)"
+            ))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        await pipeline.finish()
+
+        let requests = await provider.allRequests()
+        XCTAssertEqual(requests.flatMap(\.segments).count, 20)
+        XCTAssertTrue(requests.allSatisfy { $0.segments.count <= 8 })
+    }
+
     func testContractsEncodeTextAndRevisionIDsWithoutAudioOrPaths() throws {
         let segment = try TranslationSourceSegment(
             revisionID: TranscriptRevisionID(),

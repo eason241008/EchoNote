@@ -1,9 +1,26 @@
 import Foundation
 
+public struct TimetableRecordingContext: Equatable, Sendable {
+    public let event: ICSCourseEvent
+    public let weekNumber: Int
+    public let title: String
+
+    public init(event: ICSCourseEvent, weekNumber: Int, title: String) {
+        self.event = event
+        self.weekNumber = weekNumber
+        self.title = title
+    }
+
+    public var automaticStopAt: Date {
+        event.endsAt.addingTimeInterval(5 * 60)
+    }
+}
+
 @MainActor
 public final class TimetableStore: ObservableObject {
     @Published public private(set) var events: [ICSCourseEvent] = []
     @Published public private(set) var statusMessage: String?
+    @Published public private(set) var selectedRecordingEvent: ICSCourseEvent?
 
 
     private let defaults: UserDefaults
@@ -60,6 +77,49 @@ public final class TimetableStore: ObservableObject {
         events = parsed
     }
 
+    public func selectForRecording(_ event: ICSCourseEvent) {
+        selectedRecordingEvent = event
+    }
+
+    public func clearRecordingSelection() {
+        selectedRecordingEvent = nil
+    }
+
+    public func recordingContext(
+        at date: Date,
+        preparationLeadTime: TimeInterval = 15 * 60
+    ) -> TimetableRecordingContext? {
+        if let selectedRecordingEvent,
+           date < selectedRecordingEvent.endsAt.addingTimeInterval(5 * 60) {
+            return recordingContext(for: selectedRecordingEvent)
+        }
+        let matching = events.filter {
+            date >= $0.startsAt.addingTimeInterval(-preparationLeadTime)
+                && date < $0.endsAt.addingTimeInterval(5 * 60)
+        }.min { lhs, rhs in
+            abs(lhs.startsAt.timeIntervalSince(date)) < abs(rhs.startsAt.timeIntervalSince(date))
+        }
+        return matching.flatMap(recordingContext(for:))
+    }
+
+    public func recordingContext(for event: ICSCourseEvent) -> TimetableRecordingContext? {
+        guard events.contains(event) else { return nil }
+        let peers = events.filter {
+            recordingSeriesKey(for: $0) == recordingSeriesKey(for: event)
+        }.sorted { $0.startsAt < $1.startsAt }
+        guard let index = peers.firstIndex(of: event) else { return nil }
+        let courseLabel = event.courseCode.map { String($0.suffix(5)) }
+            ?? event.summary.split(separator: ",").first.map(String.init)
+            ?? event.summary
+        let activityLabel = event.activity ?? "课堂"
+        let weekNumber = index + 1
+        return TimetableRecordingContext(
+            event: event,
+            weekNumber: weekNumber,
+            title: "第\(weekNumber)周 · \(courseLabel) · \(activityLabel)"
+        )
+    }
+
     private static func directSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
@@ -73,5 +133,12 @@ public final class TimetableStore: ObservableObject {
         guard let contents = defaults.string(forKey: contentsKey),
               let parsed = try? parser.parse(contents) else { return }
         events = parsed.sorted { $0.startsAt < $1.startsAt }
+    }
+
+    private func recordingSeriesKey(for event: ICSCourseEvent) -> String {
+        if let courseCode = event.courseCode {
+            return "\(courseCode)|\(event.activity ?? event.summary)"
+        }
+        return event.summary
     }
 }

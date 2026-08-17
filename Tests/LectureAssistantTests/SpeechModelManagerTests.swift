@@ -34,7 +34,7 @@ final class SpeechModelManagerTests: XCTestCase {
     func testExplicitDownloadValidatesAndBecomesReady() async throws {
         let rootURL = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: rootURL) }
-        let folder = rootURL.appendingPathComponent("openai_whisper-small.en")
+        let folder = rootURL.appendingPathComponent("openai_whisper-large-v3-v20240930_626MB")
         let manager = SpeechModelManager(
             modelsRootURL: rootURL,
             downloader: StubModelDownloader(modelFolder: folder),
@@ -52,7 +52,7 @@ final class SpeechModelManagerTests: XCTestCase {
     @MainActor
     func testRemoveDeletesInstalledModelAndClearsReadiness() async throws {
         let rootURL = temporaryRoot()
-        let folder = rootURL.appendingPathComponent("openai_whisper-small.en")
+        let folder = rootURL.appendingPathComponent("openai_whisper-large-v3-v20240930_626MB")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: rootURL) }
         let manager = SpeechModelManager(
@@ -70,10 +70,34 @@ final class SpeechModelManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshExposesWhisperKitNestedDownloadFolderToRuntime() async throws {
+        let rootURL = temporaryRoot()
+        let folder = rootURL
+            .appendingPathComponent("models/argmaxinc/whisperkit-coreml", isDirectory: true)
+            .appendingPathComponent("openai_whisper-large-v3-v20240930_626MB", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let manager = SpeechModelManager(
+            modelsRootURL: rootURL,
+            downloader: StubModelDownloader(modelFolder: folder),
+            validator: StubModelValidator(error: nil)
+        )
+
+        XCTAssertEqual(manager.state, .verifying)
+        await manager.refresh()
+
+        XCTAssertTrue(manager.isReady)
+        XCTAssertEqual(
+            manager.readyModelFolder?.resolvingSymlinksInPath(),
+            folder.resolvingSymlinksInPath()
+        )
+    }
+
+    @MainActor
     func testFailedValidationNeverReportsReady() async {
         enum ExpectedFailure: Error { case invalid }
         let rootURL = temporaryRoot()
-        let folder = rootURL.appendingPathComponent("openai_whisper-small.en")
+        let folder = rootURL.appendingPathComponent("openai_whisper-large-v3-v20240930_626MB")
         defer { try? FileManager.default.removeItem(at: rootURL) }
         let manager = SpeechModelManager(
             modelsRootURL: rootURL,
@@ -95,8 +119,8 @@ final class SpeechModelManagerTests: XCTestCase {
 
     @MainActor
     func testDescriptorDisclosesDownloadAndDiskRequirements() {
-        let descriptor = SpeechModelDescriptor.smallEnglish
-        XCTAssertEqual(descriptor.id, "small.en")
+        let descriptor = SpeechModelDescriptor.largeV3Compressed
+        XCTAssertEqual(descriptor.id, "large-v3-v20240930_626MB")
         XCTAssertGreaterThan(descriptor.estimatedDownloadBytes, 0)
         XCTAssertGreaterThanOrEqual(descriptor.requiredFreeBytes, descriptor.estimatedDownloadBytes)
     }

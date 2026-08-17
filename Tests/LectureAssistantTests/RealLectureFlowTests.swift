@@ -41,7 +41,7 @@ final class RealLectureFlowTests: XCTestCase {
         let storage = SessionStorage(rootURL: root.appendingPathComponent("Sessions"))
         let captions = CaptionWorkspaceModel()
         let modelFolder = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/课堂伴侣/Models/openai_whisper-small.en")
+            .appendingPathComponent("Library/Application Support/课堂伴侣/Models/openai_whisper-large-v3-v20240930_626MB")
         let service = ProductionLectureCaptureService(
             storage: storage,
             database: database,
