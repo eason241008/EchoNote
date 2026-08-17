@@ -54,8 +54,21 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
     // device-negotiated format and avoids the uncatchable SIGABRT.
     static var inputTapFormat: AVAudioFormat? { nil }
 
+    static func fallbackDeviceIDs(
+        requestedDeviceID: AudioDeviceID,
+        devices: [AudioInputDevice]
+    ) -> [AudioDeviceID] {
+        devices
+            .filter { $0.id != requestedDeviceID }
+            .sorted {
+                if $0.isDefault != $1.isDefault { return $0.isDefault }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+            .map(\.id)
+    }
+
     private let storage: SessionStorage
-    private let engine: AVAudioEngine
+    private var engine: AVAudioEngine
     private let writer = CaptureWriterState()
     private let timeline: CaptureTimelineRecorder?
     private var preparation: LectureCapturePreparation?
@@ -92,13 +105,6 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
     public func start() async throws {
         guard let preparation else { throw AVFoundationCaptureError.notPrepared }
         guard !isRunning else { throw AVFoundationCaptureError.alreadyRunning }
-        let inputNode = engine.inputNode
-        try setInputDevice(AudioDeviceID(preparation.deviceID), inputNode: inputNode)
-        let format = inputNode.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw AVFoundationCaptureError.invalidInputFormat
-        }
-
         let manifest = try await storage.loadManifest(sessionID: preparation.session.id)
         let nextSequence = (manifest.lastCommittedChunk ?? -1) + 1
         let chunkID = try await storage.beginChunk(
@@ -111,29 +117,39 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
             sessionID: preparation.session.id,
             chunkID: chunkID
         )
-        var tapInstalled = false
-        do {
-            writer.audioFile = nil
-            writer.stagingURL = stagingURL
-            writer.chunkID = chunkID
-            writer.failure = nil
-            installTap(inputNode: inputNode)
-            tapInstalled = true
-            engine.prepare()
-            try engine.start()
-            recordingStartedAt = .now
-            isRunning = true
-            isPaused = false
-        } catch {
-            if tapInstalled {
-                inputNode.removeTap(onBus: 0)
-            }
-            writer.audioFile = nil
-            writer.stagingURL = nil
-            writer.chunkID = nil
-            await storage.abandonActiveChunk(sessionID: preparation.session.id)
-            throw AVFoundationCaptureError.audioEngineFailed
+        writer.audioFile = nil
+        writer.stagingURL = stagingURL
+        writer.chunkID = chunkID
+        writer.failure = nil
+
+        let requestedDeviceID = AudioDeviceID(preparation.deviceID)
+        var candidateDeviceIDs = [requestedDeviceID]
+        if let devices = try? CoreAudioInputDeviceProvider().inputDevices() {
+            candidateDeviceIDs.append(contentsOf: Self.fallbackDeviceIDs(
+                requestedDeviceID: requestedDeviceID,
+                devices: devices
+            ))
         }
+
+        for (index, deviceID) in candidateDeviceIDs.enumerated() {
+            do {
+                try configureAndStartEngine(deviceID: deviceID)
+                recordingStartedAt = .now
+                isRunning = true
+                isPaused = false
+                return
+            } catch {
+                await resetFailedEngineAttempt(stagingURL: stagingURL)
+                if index < candidateDeviceIDs.count - 1 {
+                    try? await Task.sleep(for: .milliseconds(200))
+                }
+            }
+        }
+
+        writer.stagingURL = nil
+        writer.chunkID = nil
+        await storage.abandonActiveChunk(sessionID: preparation.session.id)
+        throw AVFoundationCaptureError.audioEngineFailed
     }
 
     public func pause() async throws {
@@ -220,6 +236,34 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
                 }
             }
         }
+    }
+
+    private func configureAndStartEngine(deviceID: AudioDeviceID) throws {
+        let candidateEngine = AVAudioEngine()
+        engine = candidateEngine
+        let inputNode = candidateEngine.inputNode
+        try setInputDevice(deviceID, inputNode: inputNode)
+        let format = inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw AVFoundationCaptureError.invalidInputFormat
+        }
+        installTap(inputNode: inputNode)
+        do {
+            candidateEngine.prepare()
+            try candidateEngine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            candidateEngine.stop()
+            throw error
+        }
+    }
+
+    private func resetFailedEngineAttempt(stagingURL: URL) async {
+        engine.stop()
+        try? await flushWriterQueue()
+        writer.audioFile = nil
+        writer.failure = nil
+        try? FileManager.default.removeItem(at: stagingURL)
     }
 
     private func flushWriterQueue() async throws {
