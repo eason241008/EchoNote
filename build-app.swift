@@ -48,5 +48,28 @@ try run("/usr/bin/ditto", [
     appURL.path,
     archiveURL.path,
 ])
+let dmgRootURL = root.appendingPathComponent("dist/dmg-root", isDirectory: true)
+let dmgURL = root.appendingPathComponent("dist/EchoNote-\(version)-macOS-arm64.dmg")
+try? fileManager.removeItem(at: dmgRootURL)
+try? fileManager.removeItem(at: dmgURL)
+try fileManager.createDirectory(at: dmgRootURL, withIntermediateDirectories: true)
+try fileManager.copyItem(
+    at: appURL,
+    to: dmgRootURL.appendingPathComponent("EchoNote.app", isDirectory: true)
+)
+try fileManager.createSymbolicLink(
+    at: dmgRootURL.appendingPathComponent("Applications", isDirectory: true),
+    withDestinationURL: URL(fileURLWithPath: "/Applications", isDirectory: true)
+)
+try run("/usr/bin/hdiutil", [
+    "create",
+    "-volname", "EchoNote \(version)",
+    "-srcfolder", dmgRootURL.path,
+    "-format", "UDZO",
+    "-imagekey", "zlib-level=9",
+    dmgURL.path,
+])
+try fileManager.removeItem(at: dmgRootURL)
 print(appURL.path)
 print(archiveURL.path)
+print(dmgURL.path)

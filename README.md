@@ -107,7 +107,7 @@ swift build-app.swift
 open dist/EchoNote.app
 ```
 
-This creates an ad-hoc-signed `dist/EchoNote.app` and a versioned ZIP archive with the project entitlements. For distribution to other Macs, replace ad-hoc signing with your Developer ID certificate and notarize the bundle.
+This creates an ad-hoc-signed `dist/EchoNote.app`, a versioned ZIP archive, and a drag-to-install DMG with the project entitlements. For distribution to other Macs, replace ad-hoc signing with your Developer ID certificate and notarize the bundle.
 
 ## Configuration
 
