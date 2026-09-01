@@ -7,6 +7,7 @@ let appURL = root.appendingPathComponent("dist/EchoNote.app")
 let contentsURL = appURL.appendingPathComponent("Contents")
 let macOSURL = contentsURL.appendingPathComponent("MacOS")
 let resourcesURL = contentsURL.appendingPathComponent("Resources")
+let infoPlistURL = root.appendingPathComponent("Sources/LectureAssistant/Resources/Info.plist")
 
 func run(_ executable: String, _ arguments: [String]) throws {
     let process = Process()
@@ -25,7 +26,7 @@ try fileManager.createDirectory(at: macOSURL, withIntermediateDirectories: true)
 try fileManager.createDirectory(at: resourcesURL, withIntermediateDirectories: true)
 try fileManager.copyItem(at: buildExecutable, to: macOSURL.appendingPathComponent("EchoNote"))
 try fileManager.copyItem(
-    at: root.appendingPathComponent("Sources/LectureAssistant/Resources/Info.plist"),
+    at: infoPlistURL,
     to: contentsURL.appendingPathComponent("Info.plist")
 )
 try fileManager.copyItem(
@@ -37,4 +38,15 @@ try run("/usr/bin/codesign", [
     "--entitlements", root.appendingPathComponent("LectureAssistant.entitlements").path,
     appURL.path,
 ])
+let infoData = try Data(contentsOf: infoPlistURL)
+let info = try PropertyListSerialization.propertyList(from: infoData, format: nil) as? [String: Any]
+let version = info?["CFBundleShortVersionString"] as? String ?? "dev"
+let archiveURL = root.appendingPathComponent("dist/EchoNote-\(version)-macOS-arm64.zip")
+try? fileManager.removeItem(at: archiveURL)
+try run("/usr/bin/ditto", [
+    "-c", "-k", "--sequesterRsrc", "--keepParent",
+    appURL.path,
+    archiveURL.path,
+])
 print(appURL.path)
+print(archiveURL.path)

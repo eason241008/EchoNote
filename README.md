@@ -21,7 +21,7 @@ A native macOS lecture companion for live English transcription, Simplified Chin
 Fast English lectures are difficult to follow when listening, translating, and taking notes compete for attention. EchoNote keeps those jobs in one native workspace:
 
 - **English-first live captions** powered locally by WhisperKit.
-- **Optional Simplified Chinese translation** through your own OpenAI-compatible endpoint.
+- **Optional Simplified Chinese translation** through Apple's on-device Translation framework.
 - **Editable transcript timeline** with revision history instead of destructive text replacement.
 - **Evidence-linked study notes** that point back to transcript revisions.
 - **Searchable lecture library** with bookmarks, questions, key concepts, and exports.
@@ -50,9 +50,9 @@ Fast English lectures are difficult to follow when listening, translating, and t
 ### Bilingual captions
 
 - English ASR remains the source of truth.
-- Optional English-to-Simplified-Chinese translation uses `POST /chat/completions` with a JSON response contract.
-- Terminology-aware batching and ordered output preserve segment alignment.
-- API credentials are stored in macOS Keychain; provider metadata stays in UserDefaults.
+- Optional English-to-Simplified-Chinese translation uses the local macOS language model.
+- Short ordered batches preserve segment alignment without waiting for a large paragraph backlog.
+- No translation API key or third-party endpoint is required.
 - Translation failures do not stop local recording or English transcription.
 
 ### Lecture library and study evidence
@@ -85,6 +85,8 @@ EchoNote uses Apple's on-device Translation framework for English-to-Simplified-
 
 EchoNote uses [Argmax Open-Source SDK / WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) `1.0.0` for local English transcription.
 
+For the complete installation and classroom workflow, see **[中文使用指南](docs/使用指南.md)**.
+
 ## Quick Start
 
 ```bash
@@ -105,7 +107,7 @@ swift build-app.swift
 open dist/EchoNote.app
 ```
 
-This creates an ad-hoc-signed `dist/EchoNote.app` with the project entitlements. For distribution to other Macs, replace ad-hoc signing with your Developer ID certificate and notarize the bundle.
+This creates an ad-hoc-signed `dist/EchoNote.app` and a versioned ZIP archive with the project entitlements. For distribution to other Macs, replace ad-hoc signing with your Developer ID certificate and notarize the bundle.
 
 ## Configuration
 
@@ -131,35 +133,15 @@ The current production pipeline uses the multilingual, compressed WhisperKit lar
 
 This model favors English lecture transcription speed and accuracy. Multilingual source transcription is not enabled in the current production path.
 
-### 3. Translation provider
+### 3. Local Chinese translation
 
-Translation is optional. EchoNote imports one provider from an [Oh My Pi](https://github.com/can1357/oh-my-pi) `models.yml` file so the endpoint and credential do not need to be pasted into the UI.
-
-A compatible provider entry contains:
-
-```yaml
-providers:
-  openai:
-    baseUrl: https://api.example.com/v1
-    apiKey: YOUR_API_KEY
-```
-
-In **Settings → Translation service**:
-
-1. Enter the provider ID used in `models.yml` (for example, `openai`).
-2. Enter a model supported by that endpoint.
-3. Import the file.
-
-EchoNote stores the API key in macOS Keychain and calls `<baseUrl>/chat/completions`. The endpoint must accept OpenAI-compatible chat-completion requests and JSON response formatting.
-
-> [!CAUTION]
-> Never commit a real `models.yml`, API key, timetable token, recording, or exported lecture data. The repository ignore rules intentionally exclude build output and local environment files, but secrets outside ignored paths remain your responsibility.
+WhisperKit produces the English transcript. English-to-Simplified-Chinese translation is then performed by Apple's on-device Translation framework. macOS may ask to download the English and Simplified Chinese language resources the first time it is used. Translation is optional and a temporary language-model failure never stops recording or English transcription.
 
 ### 4. Timetable subscription
 
 In **Settings → Timetable subscription**, paste your own HTTPS ICS URL and choose **Save and sync**. You can also import a local `.ics` file from the timetable page.
 
-Select a timetable block to prepare its recording. EchoNote reads the subject code and activity from the Melbourne timetable metadata, numbers repeated classes by teaching week, and creates names such as `第2周 · 90016 · Tutorial1`. Scheduled recordings stop automatically five minutes after the class end time, including while manually paused.
+Select a timetable block to prepare its recording. EchoNote reads the subject code and activity from the Melbourne timetable metadata, numbers repeated classes by teaching week, and creates names such as `第2周 · 90016 · Tutorial1`. Scheduled recordings stop automatically five minutes after the class end time, including while manually paused. Classes separated by no more than five minutes continue through the same microphone engine while remaining separate records.
 
 Subscription URLs can contain private tokens. They remain in local UserDefaults and are not part of this repository.
 
@@ -169,8 +151,8 @@ EchoNote is local-first:
 
 - Audio, manifests, SQLite data, models, and exports live under `~/Library/Application Support/EchoNote/` unless you choose another export location.
 - Audio capture and English transcription run on-device.
-- Only finalized English text is sent to the translation endpoint you configure.
-- Provider API keys are stored in macOS Keychain.
+- English-to-Chinese translation runs through the macOS on-device language model.
+- No transcript or audio is sent to a user-configured translation server.
 - ICS sync contacts only the subscription URL you provide.
 - No analytics or telemetry client is included.
 
@@ -185,7 +167,7 @@ flowchart LR
     Capture --> Whisper[WhisperKit large-v3 626 MB]
     Whisper --> Revision[Transcript revisions]
     Revision --> Search[SQLite full-text search]
-    Revision --> Translate[Optional translation provider]
+    Revision --> Translate[Apple on-device translation]
     Translate --> Library[Lecture library]
     Revision --> Library
     ICS[ICS file or subscription] --> Schedule[Weekly timetable]
@@ -221,14 +203,14 @@ swift test --filter SchedulingTests
 swift test --filter AppSurfaceModelsTests
 ```
 
-The suite covers database migrations and rollback, session lifecycle, bounded streams, capture timelines, prompt behavior, translation ordering, ICS recurrence/timezones, search correction, retention, exports, Keychain importer behavior through test stores, and real microphone/provider flow behind environment gates.
+The suite covers database migrations and rollback, session lifecycle, bounded streams, capture timelines, prompt behavior, translation ordering, ICS recurrence/timezones, search correction, retention, exports, caption-window interaction, and real microphone/model flow behind environment gates.
 
 Optional hardware/provider validation uses environment variables defined by `RealLectureFlowTests.swift`; it is skipped unless explicitly enabled.
 
 ## Current Limitations
 
 - Source speech recognition is English-only in the production path.
-- Translation requires a separately configured OpenAI-compatible service and may incur provider cost.
+- Chinese translation depends on the macOS English and Simplified Chinese language resources being available.
 - Speaker diarization is not implemented.
 - The repository does not publish a notarized binary yet; build locally with the provided script.
 - Recording legality and institutional consent remain the user's responsibility.
@@ -246,7 +228,6 @@ Issues and focused pull requests are welcome. Before submitting a change:
 
 - [WhisperKit / Argmax Open-Source SDK](https://github.com/argmaxinc/argmax-oss-swift) for on-device speech recognition on Apple Silicon.
 - [OpenAI Whisper](https://github.com/openai/whisper) for the underlying speech-recognition model family.
-- [Oh My Pi](https://github.com/can1357/oh-my-pi) for the optional provider-configuration import format.
 
 ## License
 
