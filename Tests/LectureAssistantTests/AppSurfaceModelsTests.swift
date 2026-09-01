@@ -31,6 +31,7 @@ final class AppSurfaceModelsTests: XCTestCase {
         )
 
         let model = LectureLibraryModel(database: database, sessionRoot: root.appendingPathComponent("Sessions"))
+        model.loadIfNeeded()
 
         XCTAssertEqual(model.sessions.count, 1)
         XCTAssertEqual(model.sessions[0].transcriptCount, 1)
@@ -60,6 +61,7 @@ final class AppSurfaceModelsTests: XCTestCase {
         )
 
         let model = LectureLibraryModel(database: database, sessionRoot: root.appendingPathComponent("Sessions"))
+        model.loadIfNeeded()
         let states = Dictionary(uniqueKeysWithValues: model.sessions.map { ($0.title, $0.state) })
         XCTAssertEqual(states["Empty prepared"], .prepared)
         XCTAssertEqual(states["Legacy prepared"], .completed)

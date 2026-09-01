@@ -29,10 +29,18 @@ public final class TimetableStore: ObservableObject {
     private let contentsKey = "lecture-assistant.timetable-ics"
     private let subscriptionKey = "lecture-assistant.timetable-url"
 
-    public init(defaults: UserDefaults = .standard, session: URLSession? = nil) {
+    public init(
+        defaults: UserDefaults = .standard,
+        session: URLSession? = nil,
+        initialEvents: [ICSCourseEvent]? = nil
+    ) {
         self.defaults = defaults
         self.session = session ?? Self.directSession()
-        loadCachedCalendar()
+        if let initialEvents {
+            events = initialEvents.sorted { $0.startsAt < $1.startsAt }
+        } else {
+            loadCachedCalendar()
+        }
     }
 
     public var subscriptionURL: URL? {
@@ -120,6 +128,40 @@ public final class TimetableStore: ObservableObject {
         )
     }
 
+    public func recordingEventIdentifier(for event: ICSCourseEvent) -> String {
+        "\(event.uid)#\(event.recurrenceID ?? "single")"
+    }
+
+    public func recordingContext(
+        matching eventIdentifier: String
+    ) -> TimetableRecordingContext? {
+        event(matching: eventIdentifier).flatMap(recordingContext(for:))
+    }
+
+    public func followingRecordingContext(
+        after eventIdentifier: String,
+        maximumGap: TimeInterval = 5 * 60
+    ) -> TimetableRecordingContext? {
+        guard let event = event(matching: eventIdentifier),
+              let nextEvent = nextContiguousEvent(after: event, maximumGap: maximumGap)
+        else { return nil }
+        return recordingContext(for: nextEvent)
+    }
+
+    public func automaticStopDeadline(
+        after eventIdentifier: String,
+        maximumGap: TimeInterval = 5 * 60
+    ) -> Date? {
+        guard var current = event(matching: eventIdentifier) else { return nil }
+        var visited = Set([recordingEventIdentifier(for: current)])
+        while let nextEvent = nextContiguousEvent(after: current, maximumGap: maximumGap) {
+            let identifier = recordingEventIdentifier(for: nextEvent)
+            guard visited.insert(identifier).inserted else { break }
+            current = nextEvent
+        }
+        return current.endsAt.addingTimeInterval(maximumGap)
+    }
+
     private static func directSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
@@ -133,6 +175,31 @@ public final class TimetableStore: ObservableObject {
         guard let contents = defaults.string(forKey: contentsKey),
               let parsed = try? parser.parse(contents) else { return }
         events = parsed.sorted { $0.startsAt < $1.startsAt }
+    }
+
+    private func event(matching eventIdentifier: String) -> ICSCourseEvent? {
+        events.first { recordingEventIdentifier(for: $0) == eventIdentifier }
+    }
+
+    private func nextContiguousEvent(
+        after event: ICSCourseEvent,
+        maximumGap: TimeInterval
+    ) -> ICSCourseEvent? {
+        let currentIdentifier = recordingEventIdentifier(for: event)
+        let cutoff = event.endsAt.addingTimeInterval(maximumGap)
+        return events
+            .filter { candidate in
+                let identifier = recordingEventIdentifier(for: candidate)
+                return identifier != currentIdentifier
+                    && candidate.startsAt >= event.endsAt
+                    && candidate.startsAt <= cutoff
+            }
+            .min { lhs, rhs in
+                if lhs.startsAt == rhs.startsAt {
+                    return recordingEventIdentifier(for: lhs) < recordingEventIdentifier(for: rhs)
+                }
+                return lhs.startsAt < rhs.startsAt
+            }
     }
 
     private func recordingSeriesKey(for event: ICSCourseEvent) -> String {

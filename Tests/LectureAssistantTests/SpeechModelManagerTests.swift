@@ -31,7 +31,7 @@ private struct StubModelValidator: SpeechModelValidating {
 
 final class SpeechModelManagerTests: XCTestCase {
     @MainActor
-    func testExplicitDownloadValidatesAndBecomesReady() async throws {
+    func testExplicitDownloadRequiresRecognizerPrewarmBeforeBecomingReady() async throws {
         let rootURL = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: rootURL) }
         let folder = rootURL.appendingPathComponent("openai_whisper-large-v3-v20240930_626MB")
@@ -45,6 +45,11 @@ final class SpeechModelManagerTests: XCTestCase {
         XCTAssertFalse(manager.isReady)
         try await manager.downloadAfterUserConfirmation()
 
+        XCTAssertEqual(manager.state, .installed(folder))
+        XCTAssertFalse(manager.isReady)
+        XCTAssertEqual(manager.loadableModelFolder, folder)
+
+        manager.markRecognizerReady(modelFolder: folder)
         XCTAssertEqual(manager.state, .ready(folder))
         XCTAssertTrue(manager.isReady)
     }
@@ -61,6 +66,7 @@ final class SpeechModelManagerTests: XCTestCase {
             validator: StubModelValidator(error: nil)
         )
         await manager.refresh()
+        manager.markRecognizerReady(modelFolder: folder)
         XCTAssertTrue(manager.isReady)
 
         try await manager.remove()
@@ -86,9 +92,9 @@ final class SpeechModelManagerTests: XCTestCase {
         XCTAssertEqual(manager.state, .verifying)
         await manager.refresh()
 
-        XCTAssertTrue(manager.isReady)
+        XCTAssertFalse(manager.isReady)
         XCTAssertEqual(
-            manager.readyModelFolder?.resolvingSymlinksInPath(),
+            manager.loadableModelFolder?.resolvingSymlinksInPath(),
             folder.resolvingSymlinksInPath()
         )
     }
@@ -123,6 +129,38 @@ final class SpeechModelManagerTests: XCTestCase {
         XCTAssertEqual(descriptor.id, "large-v3-v20240930_626MB")
         XCTAssertGreaterThan(descriptor.estimatedDownloadBytes, 0)
         XCTAssertGreaterThanOrEqual(descriptor.requiredFreeBytes, descriptor.estimatedDownloadBytes)
+    }
+
+    func testProductionValidatorChecksModelStructureWithoutLoadingWhisperKit() async throws {
+        let rootURL = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let requiredPaths = [
+            "config.json",
+            "generation_config.json",
+            "AudioEncoder.mlmodelc/coremldata.bin",
+            "MelSpectrogram.mlmodelc/coremldata.bin",
+            "TextDecoder.mlmodelc/coremldata.bin",
+        ]
+        for relativePath in requiredPaths {
+            let url = rootURL.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data([1]).write(to: url)
+        }
+
+        try await WhisperKitModelValidator().validate(modelFolder: rootURL)
+
+        try FileManager.default.removeItem(
+            at: rootURL.appendingPathComponent("MelSpectrogram.mlmodelc/coremldata.bin")
+        )
+        do {
+            try await WhisperKitModelValidator().validate(modelFolder: rootURL)
+            XCTFail("Expected an incomplete model to fail validation")
+        } catch {
+            XCTAssertEqual(error as? SpeechModelManagerError, .invalidModelDirectory)
+        }
     }
 
     private func temporaryRoot() -> URL {

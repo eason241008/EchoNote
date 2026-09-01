@@ -85,6 +85,29 @@ final class LiveTranscriptionTests: XCTestCase {
         )
     }
 
+    func testAudioFramesReuseOneSampleRateConverter() throws {
+        let format = try XCTUnwrap(
+            AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 48_000,
+                channels: 1,
+                interleaved: false
+            )
+        )
+        let converter = ReusableAudioFrameConverter()
+        var convertedSampleCount = 0
+        for _ in 0..<100 {
+            let buffer = try XCTUnwrap(
+                AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 2_048)
+            )
+            buffer.frameLength = 2_048
+            convertedSampleCount += try converter.samples16kMono(from: buffer).count
+        }
+
+        XCTAssertEqual(converter.converterCreationCount, 1)
+        XCTAssertGreaterThan(convertedSampleCount, 60_000)
+    }
+
     func testEmptyRecognitionIsTreatedAsSilenceInsteadOfMissingAudio() async throws {
         let fixture = try await makeFixture(behavior: .empty)
         let collector = Task { () -> [LiveTranscriptSegment] in

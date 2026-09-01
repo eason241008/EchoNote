@@ -214,6 +214,13 @@ public enum LectureDatabaseSchema {
                 """,
             ]
         ),
+        LectureDatabaseMigration(
+            version: 3,
+            statements: [
+                "CREATE INDEX transcript_revisions_session_segment_revision_idx ON transcript_revisions(session_id, segment_id, revision_number DESC)",
+                "CREATE INDEX translations_session_state_idx ON translations(session_id, state)",
+            ]
+        ),
     ]
 }
 

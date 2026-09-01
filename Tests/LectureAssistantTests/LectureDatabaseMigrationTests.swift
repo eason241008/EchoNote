@@ -29,7 +29,7 @@ final class LectureDatabaseMigrationTests: XCTestCase {
 
         try database.migrate()
 
-        XCTAssertEqual(try database.userVersion(), 2)
+        XCTAssertEqual(try database.userVersion(), 3)
         XCTAssertEqual(try SQLiteCourseRepository(database: database).all(), [course])
         XCTAssertTrue(try database.tableNames().contains("lecture_search"))
         XCTAssertEqual(try SQLiteLectureSearchRepository(database: database).search("planning"), [])

@@ -19,6 +19,7 @@ public enum SpeechModelState: Equatable, Sendable {
     case notInstalled
     case downloading(Double)
     case verifying
+    case installed(URL)
     case ready(URL)
     case failed(String)
 }
@@ -57,15 +58,22 @@ public struct WhisperKitModelValidator: SpeechModelValidating {
     public init() {}
 
     public func validate(modelFolder: URL) async throws {
-        let config = WhisperKitConfig(
-            model: SpeechModelDescriptor.largeV3Compressed.id,
-            modelFolder: modelFolder.path,
-            verbose: false,
-            prewarm: false,
-            load: true,
-            download: false
-        )
-        _ = try await WhisperKit(config)
+        let fileManager = FileManager.default
+        let requiredPaths = [
+            "config.json",
+            "generation_config.json",
+            "AudioEncoder.mlmodelc/coremldata.bin",
+            "MelSpectrogram.mlmodelc/coremldata.bin",
+            "TextDecoder.mlmodelc/coremldata.bin",
+        ]
+        for relativePath in requiredPaths {
+            let url = modelFolder.appendingPathComponent(relativePath)
+            guard fileManager.fileExists(atPath: url.path),
+                  let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                  size > 0 else {
+                throw SpeechModelManagerError.invalidModelDirectory
+            }
+        }
     }
 }
 
@@ -125,9 +133,16 @@ public final class SpeechModelManager: ObservableObject {
         return modelFolder
     }
 
+    public var loadableModelFolder: URL? {
+        switch state {
+        case let .installed(modelFolder), let .ready(modelFolder): return modelFolder
+        default: return nil
+        }
+    }
+
     public var isBusy: Bool {
         switch state {
-        case .downloading, .verifying: return true
+        case .downloading, .verifying, .installed: return true
         case .notInstalled, .ready, .failed: return false
         }
     }
@@ -137,6 +152,7 @@ public final class SpeechModelManager: ObservableObject {
         case .notInstalled: return "未安装"
         case let .downloading(progress): return "下载中 · \(Int(progress * 100))%"
         case .verifying: return "正在验证"
+        case .installed: return "正在加载"
         case .ready: return "已就绪"
         case .failed: return "验证失败"
         }
@@ -151,7 +167,7 @@ public final class SpeechModelManager: ObservableObject {
         state = .verifying
         do {
             try await validator.validate(modelFolder: candidate)
-            state = .ready(candidate)
+            state = .installed(candidate)
         } catch {
             state = .failed(SpeechModelManagerError.invalidModelDirectory.localizedDescription)
         }
@@ -181,7 +197,7 @@ public final class SpeechModelManager: ObservableObject {
             )
             state = .verifying
             try await validator.validate(modelFolder: folder)
-            state = .ready(folder)
+            state = .installed(folder)
         } catch {
             state = .failed(error.localizedDescription)
             throw error
@@ -200,6 +216,16 @@ public final class SpeechModelManager: ObservableObject {
         state = .notInstalled
     }
 
+    public func markRecognizerReady(modelFolder: URL) {
+        guard let installedFolder = loadableModelFolder,
+              installedFolder.standardizedFileURL == modelFolder.standardizedFileURL else { return }
+        state = .ready(installedFolder)
+    }
+
+    public func markRecognizerFailed(_ error: Error) {
+        state = .failed(error.localizedDescription)
+    }
+
     private func installedCandidates() -> [URL] {
         Self.installedModelFolders(
             descriptor: descriptor,
@@ -208,18 +234,30 @@ public final class SpeechModelManager: ObservableObject {
         )
     }
 
-    static func installedModelFolders(
+    nonisolated static func installedModelFolders(
         descriptor: SpeechModelDescriptor = .largeV3Compressed,
         modelsRootURL: URL,
         fileManager: FileManager = .default
     ) -> [URL] {
+        let folderName = "openai_whisper-\(descriptor.id)"
+        let expectedLocations = [
+            modelsRootURL.appendingPathComponent(folderName, isDirectory: true),
+            modelsRootURL
+                .appendingPathComponent("models/argmaxinc/whisperkit-coreml", isDirectory: true)
+                .appendingPathComponent(folderName, isDirectory: true),
+        ]
+        let existingExpectedLocations = expectedLocations.filter {
+            fileManager.fileExists(atPath: $0.path)
+        }
+        if !existingExpectedLocations.isEmpty { return existingExpectedLocations }
+
         guard let enumerator = fileManager.enumerator(
             at: modelsRootURL,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
         return enumerator.compactMap { $0 as? URL }.filter {
-            $0.lastPathComponent == "openai_whisper-\(descriptor.id)"
+            $0.lastPathComponent == folderName
         }
     }
 

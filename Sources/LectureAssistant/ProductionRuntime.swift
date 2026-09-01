@@ -55,7 +55,7 @@ public final class ProductionRuntime: ObservableObject {
             storage: storage,
             database: database,
             modelFolderProvider: {
-                speechModelManager.readyModelFolder
+                speechModelManager.loadableModelFolder
             },
             captionWorkspace: captionWorkspace,
             translationProvider: translationProvider
@@ -75,6 +75,7 @@ public final class ProductionRuntime: ObservableObject {
             defaults: defaults,
             preflightService: CapturePreflightService(),
             storageRootURL: sessionsURL,
+            timetable: timetable,
             transcriptionModelReady: {
                 speechModelManager.isReady
             }

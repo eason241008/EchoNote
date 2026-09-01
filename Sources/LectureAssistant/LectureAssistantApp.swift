@@ -154,6 +154,7 @@ struct ContentView: View {
         target: Locale.Language(identifier: "zh-Hans")
     )
     @State private var overlayController: CaptionOverlayWindowController?
+    @State private var prewarmingModelFolder: URL?
 
     private var selection: AppSection {
         get { AppSection(rawValue: selectionRawValue) ?? .recording }
@@ -187,7 +188,7 @@ struct ContentView: View {
                         .frame(maxWidth: 980, alignment: .leading)
                     }
                     .onChange(of: latestCaptionUpdateToken) {
-                        guard selection == .recording || selection == .captions else { return }
+                        guard selection == .recording else { return }
                         withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo("latest-caption-page-bottom", anchor: .bottom)
                         }
@@ -201,18 +202,15 @@ struct ContentView: View {
         .frame(minWidth: 940, minHeight: 640)
         .preferredColorScheme(.dark)
         .task {
+            // Let AppKit present an interactive window before Core ML starts
+            // allocating the large-v3 model.
+            try? await Task.sleep(for: .milliseconds(350))
             await speechModel.refresh()
-            if speechModel.isReady {
-                captionWorkspace.updateTranscriptionState("正在预热本地模型")
-                do {
-                    try await prewarmSpeechRecognizer()
-                    captionWorkspace.updateTranscriptionState("本地模型已就绪")
-                } catch {
-                    captionWorkspace.updateTranscriptionState("本地模型预热失败")
-                }
-            } else {
+            if case .notInstalled = speechModel.state {
                 captionWorkspace.updateTranscriptionState("本地模型未安装")
             }
+        }
+        .task {
             await model.refreshCapturePreflight()
             await timetable.refresh()
         }
@@ -237,15 +235,41 @@ struct ContentView: View {
             }
         }
         .onChange(of: speechModel.state) {
-            captionWorkspace.updateTranscriptionState(
-                speechModel.isReady ? "本地模型已就绪" : "本地模型未安装"
-            )
+            handleSpeechModelState(speechModel.state)
             Task { await model.refreshCapturePreflight() }
         }
         .onChange(of: model.recordingIndicator.state) {
             if model.recordingIndicator.state == .recording {
                 showCaptionOverlay()
             }
+        }
+    }
+
+    private func handleSpeechModelState(_ state: SpeechModelState) {
+        switch state {
+        case let .installed(modelFolder):
+            guard prewarmingModelFolder != modelFolder else { return }
+            prewarmingModelFolder = modelFolder
+            captionWorkspace.updateTranscriptionState("正在预热本地模型")
+            Task { @MainActor in
+                do {
+                    try await prewarmSpeechRecognizer()
+                    speechModel.markRecognizerReady(modelFolder: modelFolder)
+                } catch {
+                    speechModel.markRecognizerFailed(error)
+                }
+                prewarmingModelFolder = nil
+            }
+        case .ready:
+            captionWorkspace.updateTranscriptionState("本地模型已就绪")
+        case .downloading:
+            captionWorkspace.updateTranscriptionState("正在下载本地模型")
+        case .verifying:
+            captionWorkspace.updateTranscriptionState("正在验证本地模型")
+        case .notInstalled:
+            captionWorkspace.updateTranscriptionState("本地模型未安装")
+        case .failed:
+            captionWorkspace.updateTranscriptionState("本地模型加载失败")
         }
     }
 
@@ -367,8 +391,7 @@ struct ContentView: View {
             SettingsPage(
                 translationState: translationServiceState,
                 runtime: runtimeSettings,
-                speechModel: speechModel,
-                prewarmSpeechRecognizer: prewarmSpeechRecognizer
+                speechModel: speechModel
             )
         }
     }
@@ -760,6 +783,7 @@ private struct CaptionPage: View {
     @ObservedObject var model: CaptionWorkspaceModel
     let showOverlay: () -> Void
     let refreshOverlay: () -> Void
+    @State private var scrollFollowState = CaptionScrollFollowState()
 
     private var latestUpdateToken: String {
         guard let segment = model.segments.last else { return "empty" }
@@ -858,8 +882,17 @@ private struct CaptionPage: View {
                                 }
                             }
                             .frame(maxHeight: 420)
+                            .onScrollGeometryChange(for: Bool.self) { geometry in
+                                geometry.visibleRect.maxY >= geometry.contentSize.height - 24
+                            } action: { _, isAtBottom in
+                                scrollFollowState.updateGeometry(isAtBottom: isAtBottom)
+                            }
+                            .onScrollPhaseChange { _, phase in
+                                scrollFollowState.updateScrollPhase(isIdle: phase == .idle)
+                            }
                             .onAppear { scrollToLatest(using: proxy, animated: false) }
                             .onChange(of: latestUpdateToken) {
+                                guard scrollFollowState.followsLatest else { return }
                                 scrollToLatest(using: proxy, animated: true)
                             }
                         }
@@ -950,7 +983,10 @@ private struct LibraryPage: View {
                 SoftCard {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("历史课程").font(.headline)
-                        if model.sessions.isEmpty {
+                        if model.isLoading {
+                            ProgressView("正在加载课程资料…")
+                                .padding(.vertical, 24)
+                        } else if model.sessions.isEmpty {
                             Text("完成课堂录音后，记录会显示在这里。")
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 24)
@@ -1084,7 +1120,7 @@ private struct LibraryPage: View {
             Button("删除", role: .destructive) { model.deleteSelectedSession() }
             Button("取消", role: .cancel) {}
         }
-        .task { model.refresh() }
+        .task { model.loadIfNeeded() }
     }
 }
 
@@ -1092,7 +1128,6 @@ private struct SettingsPage: View {
     let translationState: AppleTranslationServiceState
     @ObservedObject var runtime: RuntimeSettingsModel
     @ObservedObject var speechModel: SpeechModelManager
-    let prewarmSpeechRecognizer: () async throws -> Void
     @State private var timetableURL = ""
     @State private var modelErrorMessage: String?
 
@@ -1133,15 +1168,14 @@ private struct SettingsPage: View {
                             .foregroundStyle(.secondary)
                     } else if case .verifying = speechModel.state {
                         ProgressView("正在验证本地模型…")
+                    } else if case .installed = speechModel.state {
+                        ProgressView("正在加载并预热本地模型…")
                     }
                     HStack(spacing: 12) {
                         if speechModel.isReady {
                             Button("重新验证") {
                                 Task {
                                     await speechModel.refresh()
-                                    if speechModel.isReady {
-                                        try? await prewarmSpeechRecognizer()
-                                    }
                                 }
                             }
                             .buttonStyle(SecondaryActionButtonStyle())
@@ -1161,7 +1195,6 @@ private struct SettingsPage: View {
                                 Task {
                                     do {
                                         try await speechModel.downloadAfterUserConfirmation()
-                                        try await prewarmSpeechRecognizer()
                                         modelErrorMessage = nil
                                     } catch {
                                         modelErrorMessage = error.localizedDescription

@@ -18,6 +18,7 @@ public final class ApplicationModel: ObservableObject {
     private let indicatorStore: RecordingIndicatorStore
     private let preflightService: CapturePreflightService?
     private let storageRootURL: URL?
+    private let timetable: TimetableStore
     private let transcriptionModelReady: @MainActor @Sendable () -> Bool
     private let automaticStopGracePeriod: TimeInterval
     private var automaticStopTask: Task<Void, Never>?
@@ -30,6 +31,7 @@ public final class ApplicationModel: ObservableObject {
         indicatorStore: RecordingIndicatorStore? = nil,
         preflightService: CapturePreflightService? = nil,
         storageRootURL: URL? = nil,
+        timetable: TimetableStore? = nil,
         automaticStopGracePeriod: TimeInterval = 5 * 60,
         transcriptionModelReady: @escaping @MainActor @Sendable () -> Bool = { false }
     ) {
@@ -40,6 +42,7 @@ public final class ApplicationModel: ObservableObject {
         self.indicatorStore = indicatorStore ?? RecordingIndicatorStore(defaults: defaults)
         self.preflightService = preflightService
         self.storageRootURL = storageRootURL
+        self.timetable = timetable ?? TimetableStore(defaults: defaults)
         self.automaticStopGracePeriod = automaticStopGracePeriod
         self.transcriptionModelReady = transcriptionModelReady
         recordingIndicator = self.indicatorStore.snapshot
@@ -64,11 +67,10 @@ public final class ApplicationModel: ObservableObject {
     }
 
     public func prepareSession(for context: TimetableRecordingContext) {
-        let event = context.event
         prepareSession(
             title: context.title,
-            scheduledEventID: "\(event.uid)#\(event.recurrenceID ?? "single")",
-            scheduledEndAt: event.endsAt
+            scheduledEventID: timetable.recordingEventIdentifier(for: context.event),
+            scheduledEndAt: context.event.endsAt
         )
     }
 
@@ -184,10 +186,23 @@ public final class ApplicationModel: ObservableObject {
     private func scheduleAutomaticStop(for session: LectureSession) {
         cancelAutomaticStop()
         guard let scheduledEndAt = session.scheduledEndAt?.date else { return }
-        let deadline = scheduledEndAt.addingTimeInterval(automaticStopGracePeriod)
+        let nextContext = session.scheduledEventID.flatMap {
+            timetable.followingRecordingContext(
+                after: $0,
+                maximumGap: automaticStopGracePeriod
+            )
+        }
+        let deadline = session.scheduledEventID.flatMap {
+            timetable.automaticStopDeadline(
+                after: $0,
+                maximumGap: automaticStopGracePeriod
+            )
+        } ?? scheduledEndAt.addingTimeInterval(automaticStopGracePeriod)
+        let actionDate = nextContext?.event.startsAt ?? deadline
         automaticStopAt = deadline
         automaticStopFailureMessage = nil
-        let delay = max(0, deadline.timeIntervalSinceNow)
+        let delay = max(0, actionDate.timeIntervalSinceNow)
+        let expectedSessionID = session.id
         automaticStopTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(delay))
@@ -197,8 +212,19 @@ public final class ApplicationModel: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             self.automaticStopTask = nil
             do {
-                try await self.performStopRecording()
-                self.automaticStopAt = nil
+                guard let activeSession = self.activeSession,
+                      activeSession.id == expectedSessionID,
+                      activeSession.state == .recording || activeSession.state == .paused
+                else { return }
+                if let nextContext {
+                    try await self.performAutomaticRollover(
+                        from: activeSession,
+                        to: nextContext
+                    )
+                } else {
+                    try await self.performStopRecording()
+                    self.automaticStopAt = nil
+                }
             } catch {
                 self.automaticStopFailureMessage = "课后自动结束失败：\(error.localizedDescription)"
             }
@@ -210,6 +236,38 @@ public final class ApplicationModel: ObservableObject {
         automaticStopTask = nil
         automaticStopAt = nil
     }
+
+    private func performAutomaticRollover(
+        from currentSession: LectureSession,
+        to nextContext: TimetableRecordingContext
+    ) async throws {
+        let nextState = currentSession.state
+        var nextSession = LectureSession(
+            courseID: nil,
+            title: nextContext.title,
+            scheduledEventID: timetable.recordingEventIdentifier(for: nextContext.event),
+            scheduledEndAt: LectureTimestamp(nextContext.event.endsAt),
+            state: nextState
+        )
+        nextSession.updatedAt = LectureTimestamp()
+        try await services.capture.rollover(to: nextSession)
+        activeSession = nextSession
+        persist(nextSession)
+        updateIndicatorForRollover(sessionID: nextSession.id, state: nextState)
+        scheduleAutomaticStop(for: nextSession)
+    }
+
+    private func updateIndicatorForRollover(
+        sessionID: SessionID,
+        state: SessionState
+    ) {
+        indicatorStore.begin(sessionID: sessionID)
+        if state == .paused {
+            indicatorStore.pause()
+        }
+        recordingIndicator = indicatorStore.snapshot
+    }
+
     private func restoreSession() {
         guard let data = defaults.data(forKey: sessionKey),
               let session = try? JSONDecoder().decode(LectureSession.self, from: data) else { return }

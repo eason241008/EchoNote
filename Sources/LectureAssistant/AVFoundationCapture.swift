@@ -6,15 +6,18 @@ public struct CapturedAudioFrame: @unchecked Sendable {
     public let buffer: AVAudioPCMBuffer
     public let capturedAt: ContinuousClock.Instant
     public let activity: AudioActivityLevel
+    public let sessionID: SessionID?
 
     public init(
         buffer: AVAudioPCMBuffer,
         capturedAt: ContinuousClock.Instant,
-        activity: AudioActivityLevel
+        activity: AudioActivityLevel,
+        sessionID: SessionID? = nil
     ) {
         self.buffer = buffer
         self.capturedAt = capturedAt
         self.activity = activity
+        self.sessionID = sessionID
     }
 }
 
@@ -40,14 +43,25 @@ public enum AVFoundationCaptureError: LocalizedError, Equatable {
 
 private final class CaptureWriterState: @unchecked Sendable {
     let queue = DispatchQueue(label: "com.lectureassistant.capture-writer", qos: .userInitiated)
-    var audioFile: AVAudioFile?
-    var stagingURL: URL?
-    var chunkID: UUID?
+    var activeSink: CaptureWriterSink?
     var frameStream: BoundedAsyncStream<CapturedAudioFrame>?
-    var failure: Error?
 }
 
-public actor AVFoundationLectureCaptureService: LectureCaptureService {
+private final class CaptureWriterSink: @unchecked Sendable {
+    let sessionID: SessionID
+    let chunkID: UUID
+    let stagingURL: URL
+    var audioFile: AVAudioFile?
+    var failure: Error?
+
+    init(sessionID: SessionID, chunkID: UUID, stagingURL: URL) {
+        self.sessionID = sessionID
+        self.chunkID = chunkID
+        self.stagingURL = stagingURL
+    }
+}
+
+public actor AVFoundationLectureCaptureService {
     // Passing a non-nil format makes AVFAudio call SetOutputFormat on the
     // microphone node. That can raise an Objective-C exception while macOS is
     // still settling a newly selected route. A nil tap format keeps the
@@ -67,6 +81,20 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
             .map(\.id)
     }
 
+    static func startAttemptDeviceIDs(
+        requestedDeviceID: AudioDeviceID,
+        devices: [AudioInputDevice],
+        attemptsPerDevice: Int = 2
+    ) -> [AudioDeviceID] {
+        let orderedDevices = [requestedDeviceID] + fallbackDeviceIDs(
+            requestedDeviceID: requestedDeviceID,
+            devices: devices
+        )
+        return orderedDevices.flatMap {
+            Array(repeating: $0, count: max(1, attemptsPerDevice))
+        }
+    }
+
     private let storage: SessionStorage
     private var engine: AVAudioEngine
     private let writer = CaptureWriterState()
@@ -75,6 +103,7 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
     private var recordingStartedAt: ContinuousClock.Instant?
     private var isRunning = false
     private var isPaused = false
+    private var retiredWriterTasks: [Task<Void, Never>] = []
     private let frameStream: BoundedAsyncStream<CapturedAudioFrame>
     public nonisolated let frames: AsyncStream<CapturedAudioFrame>
     public nonisolated var droppedFrameCount: Int { frameStream.droppedCount }
@@ -105,30 +134,18 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
     public func start() async throws {
         guard let preparation else { throw AVFoundationCaptureError.notPrepared }
         guard !isRunning else { throw AVFoundationCaptureError.alreadyRunning }
-        let manifest = try await storage.loadManifest(sessionID: preparation.session.id)
-        let nextSequence = (manifest.lastCommittedChunk ?? -1) + 1
-        let chunkID = try await storage.beginChunk(
-            sessionID: preparation.session.id,
-            sequenceNumber: nextSequence,
-            startsAt: 0,
-            externalWriter: true
-        )
-        let stagingURL = try await storage.activeChunkStagingURL(
-            sessionID: preparation.session.id,
-            chunkID: chunkID
-        )
-        writer.audioFile = nil
-        writer.stagingURL = stagingURL
-        writer.chunkID = chunkID
-        writer.failure = nil
+        let sink = try await makeWriterSink(for: preparation.session.id)
+        await replaceActiveSink(with: sink)
 
         let requestedDeviceID = AudioDeviceID(preparation.deviceID)
-        var candidateDeviceIDs = [requestedDeviceID]
+        let candidateDeviceIDs: [AudioDeviceID]
         if let devices = try? CoreAudioInputDeviceProvider().inputDevices() {
-            candidateDeviceIDs.append(contentsOf: Self.fallbackDeviceIDs(
+            candidateDeviceIDs = Self.startAttemptDeviceIDs(
                 requestedDeviceID: requestedDeviceID,
                 devices: devices
-            ))
+            )
+        } else {
+            candidateDeviceIDs = [requestedDeviceID, requestedDeviceID]
         }
 
         for (index, deviceID) in candidateDeviceIDs.enumerated() {
@@ -139,17 +156,39 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
                 isPaused = false
                 return
             } catch {
-                await resetFailedEngineAttempt(stagingURL: stagingURL)
+                await resetFailedEngineAttempt(sink: sink)
                 if index < candidateDeviceIDs.count - 1 {
-                    try? await Task.sleep(for: .milliseconds(200))
+                    // Bluetooth and newly switched Core Audio routes can be
+                    // visible before their input stream is ready to start.
+                    try? await Task.sleep(for: .milliseconds(350))
                 }
             }
         }
 
-        writer.stagingURL = nil
-        writer.chunkID = nil
+        await replaceActiveSink(with: nil)
         await storage.abandonActiveChunk(sessionID: preparation.session.id)
         throw AVFoundationCaptureError.audioEngineFailed
+    }
+
+    public func rollover(to nextPreparation: LectureCapturePreparation) async throws {
+        guard isRunning,
+              let currentPreparation = preparation,
+              let startedAt = recordingStartedAt else {
+            throw AVFoundationCaptureError.notPrepared
+        }
+        let nextSink = try await makeWriterSink(for: nextPreparation.session.id)
+        let cutoverAt = ContinuousClock.now
+        guard let currentSink = await replaceActiveSink(with: nextSink) else {
+            await storage.abandonActiveChunk(sessionID: nextPreparation.session.id)
+            throw AVFoundationCaptureError.notPrepared
+        }
+        preparation = nextPreparation
+        recordingStartedAt = cutoverAt
+        retiredWriterTasks.append(retireWriterSink(
+            currentSink,
+            sessionID: currentPreparation.session.id,
+            duration: startedAt.duration(to: cutoverAt).seconds
+        ))
     }
 
     public func pause() async throws {
@@ -176,27 +215,31 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
         engine.inputNode.removeTap(onBus: 0)
         try await flushWriterQueue()
         frameStream.finish()
-        guard let chunkID = writer.chunkID, writer.audioFile != nil else {
+        for task in retiredWriterTasks {
+            _ = await task.result
+        }
+        retiredWriterTasks.removeAll(keepingCapacity: false)
+        guard let sink = await currentActiveSink(), sink.audioFile != nil else {
             _ = try? await timeline?.record(.storageFailure)
             await storage.abandonActiveChunk(sessionID: preparation.session.id)
-            resetCaptureState()
+            await resetCaptureState()
             throw AVFoundationCaptureError.chunkWriteFailed
         }
-        if writer.failure != nil {
+        if sink.failure != nil {
             _ = try? await timeline?.record(.storageFailure)
             await storage.abandonActiveChunk(sessionID: preparation.session.id)
-            resetCaptureState()
+            await resetCaptureState()
             throw AVFoundationCaptureError.chunkWriteFailed
         }
-        writer.audioFile = nil
+        sink.audioFile = nil
         let duration = startedAt.duration(to: .now).seconds
         _ = try await storage.finalizeChunk(
             sessionID: preparation.session.id,
-            chunkID: chunkID,
+            chunkID: sink.chunkID,
             endsAt: duration
         )
         _ = try? await timeline?.record(.stopped)
-        resetCaptureState()
+        await resetCaptureState()
     }
 
     private func installTap(inputNode: AVAudioInputNode) {
@@ -209,18 +252,18 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
             let capturedAt = ContinuousClock.now
             let activity = AudioActivityMeter.measure(buffer: copy)
             writer.queue.async {
-                guard writer.failure == nil, writer.chunkID != nil,
-                      let stagingURL = writer.stagingURL else { return }
+                guard let sink = writer.activeSink else { return }
+                guard sink.failure == nil else { return }
                 do {
                     let file: AVAudioFile
-                    if let existingFile = writer.audioFile {
+                    if let existingFile = sink.audioFile {
                         file = existingFile
                     } else {
                         let newFile = try AVAudioFile(
-                            forWriting: stagingURL,
+                            forWriting: sink.stagingURL,
                             settings: copy.format.settings
                         )
-                        writer.audioFile = newFile
+                        sink.audioFile = newFile
                         file = newFile
                     }
                     try file.write(from: copy)
@@ -228,11 +271,12 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
                         CapturedAudioFrame(
                             buffer: copy,
                             capturedAt: capturedAt,
-                            activity: activity
+                            activity: activity,
+                            sessionID: sink.sessionID
                         )
                     )
                 } catch {
-                    writer.failure = error
+                    sink.failure = error
                 }
             }
         }
@@ -258,12 +302,63 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
         }
     }
 
-    private func resetFailedEngineAttempt(stagingURL: URL) async {
+    private func makeWriterSink(for sessionID: SessionID) async throws -> CaptureWriterSink {
+        let manifest = try await storage.loadManifest(sessionID: sessionID)
+        let nextSequence = (manifest.lastCommittedChunk ?? -1) + 1
+        let chunkID = try await storage.beginChunk(
+            sessionID: sessionID,
+            sequenceNumber: nextSequence,
+            startsAt: 0,
+            externalWriter: true
+        )
+        let stagingURL = try await storage.activeChunkStagingURL(
+            sessionID: sessionID,
+            chunkID: chunkID
+        )
+        return CaptureWriterSink(
+            sessionID: sessionID,
+            chunkID: chunkID,
+            stagingURL: stagingURL
+        )
+    }
+
+    private func retireWriterSink(
+        _ sink: CaptureWriterSink,
+        sessionID: SessionID,
+        duration: TimeInterval
+    ) -> Task<Void, Never> {
+        Task { [storage, timeline] in
+            if sink.failure != nil {
+                _ = try? await timeline?.record(.storageFailure)
+                await storage.abandonActiveChunk(sessionID: sessionID)
+                sink.audioFile = nil
+                sink.failure = nil
+                return
+            }
+            guard sink.audioFile != nil else {
+                await storage.abandonActiveChunk(sessionID: sessionID)
+                return
+            }
+            sink.audioFile = nil
+            do {
+                _ = try await storage.finalizeChunk(
+                    sessionID: sessionID,
+                    chunkID: sink.chunkID,
+                    endsAt: duration
+                )
+            } catch {
+                _ = try? await timeline?.record(.storageFailure)
+                await storage.abandonActiveChunk(sessionID: sessionID)
+            }
+        }
+    }
+
+    private func resetFailedEngineAttempt(sink: CaptureWriterSink) async {
         engine.stop()
         try? await flushWriterQueue()
-        writer.audioFile = nil
-        writer.failure = nil
-        try? FileManager.default.removeItem(at: stagingURL)
+        sink.audioFile = nil
+        sink.failure = nil
+        try? FileManager.default.removeItem(at: sink.stagingURL)
     }
 
     private func flushWriterQueue() async throws {
@@ -272,10 +367,27 @@ public actor AVFoundationLectureCaptureService: LectureCaptureService {
         }
     }
 
-    private func resetCaptureState() {
-        writer.audioFile = nil
-        writer.stagingURL = nil
-        writer.chunkID = nil
+    @discardableResult
+    private func replaceActiveSink(with sink: CaptureWriterSink?) async -> CaptureWriterSink? {
+        await withCheckedContinuation { continuation in
+            writer.queue.async { [writer] in
+                let previous = writer.activeSink
+                writer.activeSink = sink
+                continuation.resume(returning: previous)
+            }
+        }
+    }
+
+    private func currentActiveSink() async -> CaptureWriterSink? {
+        await withCheckedContinuation { continuation in
+            writer.queue.async { [writer] in
+                continuation.resume(returning: writer.activeSink)
+            }
+        }
+    }
+
+    private func resetCaptureState() async {
+        await replaceActiveSink(with: nil)
         recordingStartedAt = nil
         isRunning = false
         isPaused = false

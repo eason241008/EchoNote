@@ -19,6 +19,7 @@ public final class LectureLibraryModel: ObservableObject {
     @Published public private(set) var selectedSnapshot: LectureSnapshot?
     @Published public private(set) var selectedPostClassTranscripts: [PostClassTranscriptDocument] = []
     @Published public private(set) var statusMessage: String?
+    @Published public private(set) var isLoading = false
     @Published public var selectedSessionID: SessionID? {
         didSet { loadSelectedSnapshot() }
     }
@@ -27,30 +28,36 @@ public final class LectureLibraryModel: ObservableObject {
     private let sessionRoot: URL
     private let storage: SessionStorage
     private let exporter = LectureSnapshotExporter()
+    private var hasLoaded = false
 
     public init(database: LectureDatabase, sessionRoot: URL) {
         self.database = database
         self.sessionRoot = sessionRoot
         storage = SessionStorage(rootURL: sessionRoot)
-        refresh()
     }
 
     public var selectedSession: LibrarySessionSummary? {
         sessions.first { $0.id == selectedSessionID }
     }
 
+    public func loadIfNeeded() {
+        guard !hasLoaded else { return }
+        refresh()
+    }
+
     public func refresh() {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
         do {
             try rebuildSearchIndex()
             try normalizeLegacySessionStates()
             sessions = try database.query(
                 """
                 SELECT s.id, s.title, s.state, s.created_at, s.updated_at,
-                       COUNT(DISTINCT tr.id), COUNT(DISTINCT t.id)
+                       (SELECT COUNT(*) FROM transcript_revisions tr WHERE tr.session_id = s.id),
+                       (SELECT COUNT(*) FROM translations t WHERE t.session_id = s.id AND t.state = 'current')
                 FROM lecture_sessions s
-                LEFT JOIN transcript_revisions tr ON tr.session_id = s.id
-                LEFT JOIN translations t ON t.session_id = s.id AND t.state = 'current'
-                GROUP BY s.id
                 ORDER BY s.updated_at DESC
                 """,
                 bindings: []
@@ -71,6 +78,7 @@ public final class LectureLibraryModel: ObservableObject {
                 loadSelectedSnapshot()
             }
             statusMessage = nil
+            hasLoaded = true
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -131,13 +139,16 @@ public final class LectureLibraryModel: ObservableObject {
             """
             SELECT tr.segment_id, tr.id, tr.starts_at, tr.ends_at, tr.text, tr.status
             FROM transcript_revisions tr
-            JOIN (
-                SELECT segment_id, MAX(revision_number) AS revision_number
-                FROM transcript_revisions WHERE session_id = ? GROUP BY segment_id
-            ) current ON current.segment_id = tr.segment_id AND current.revision_number = tr.revision_number
-            WHERE tr.session_id = ? ORDER BY tr.starts_at
+            WHERE tr.session_id = ?
+              AND tr.revision_number = (
+                  SELECT MAX(newer.revision_number)
+                  FROM transcript_revisions newer
+                  WHERE newer.session_id = tr.session_id
+                    AND newer.segment_id = tr.segment_id
+              )
+            ORDER BY tr.starts_at
             """,
-            bindings: [.text(sessionID.rawValue.uuidString), .text(sessionID.rawValue.uuidString)]
+            bindings: [.text(sessionID.rawValue.uuidString)]
         ) { statement in
             LectureSnapshot.Segment(
                 id: String(cString: sqlite3_column_text(statement, 0)),
@@ -183,30 +194,41 @@ public final class LectureLibraryModel: ObservableObject {
     }
 
     private func rebuildSearchIndex() throws {
-        let search = SQLiteLectureSearchRepository(database: database)
-        let transcriptRows = try database.query(
-            """
-            SELECT session_id, segment_id
-            FROM transcript_revisions
-            GROUP BY session_id, segment_id
-            """,
-            bindings: []
-        ) { statement in
-            (
-                sessionID: SessionID(rawValue: UUID(uuidString: String(cString: sqlite3_column_text(statement, 0)))!),
-                segmentID: String(cString: sqlite3_column_text(statement, 1))
+        try database.transaction {
+            try database.execute(
+                "DELETE FROM lecture_search WHERE content_type IN ('transcript', 'translation')"
+            )
+            try database.execute(
+                """
+                INSERT INTO lecture_search (
+                    content_id, session_id, content_type, source_revision_id,
+                    starts_at, ends_at, text
+                )
+                SELECT tr.segment_id, tr.session_id, 'transcript', tr.id,
+                       tr.starts_at, tr.ends_at, tr.text
+                FROM transcript_revisions tr
+                WHERE tr.revision_number = (
+                    SELECT MAX(newer.revision_number)
+                    FROM transcript_revisions newer
+                    WHERE newer.session_id = tr.session_id
+                      AND newer.segment_id = tr.segment_id
+                )
+                """
+            )
+            try database.execute(
+                """
+                INSERT INTO lecture_search (
+                    content_id, session_id, content_type, source_revision_id,
+                    starts_at, ends_at, text
+                )
+                SELECT t.id, t.session_id, 'translation', t.source_revision_id,
+                       tr.starts_at, tr.ends_at, t.text
+                FROM translations t
+                LEFT JOIN transcript_revisions tr ON tr.id = t.source_revision_id
+                WHERE t.state = 'current'
+                """
             )
         }
-        for row in transcriptRows {
-            try search.indexCurrentTranscript(sessionID: row.sessionID, segmentID: row.segmentID)
-        }
-        let translationIDs = try database.query(
-            "SELECT id FROM translations WHERE state = 'current'",
-            bindings: []
-        ) { statement in
-            UUID(uuidString: String(cString: sqlite3_column_text(statement, 0)))!
-        }
-        for id in translationIDs { try search.indexTranslation(id: id) }
     }
 
     private func loadSelectedSnapshot() {
@@ -244,6 +266,7 @@ public final class RuntimeSettingsModel: ObservableObject {
     @Published public private(set) var modelSize: Int64 = 0
     @Published public private(set) var storageSize: Int64 = 0
     @Published public private(set) var retentionDays: Int
+    @Published public private(set) var isRefreshing = false
 
     public let applicationSupportURL: URL
     public let modelsRootURL: URL
@@ -263,7 +286,6 @@ public final class RuntimeSettingsModel: ObservableObject {
         self.timetable = timetable
         self.defaults = defaults
         retentionDays = defaults.object(forKey: retentionKey) == nil ? 30 : defaults.integer(forKey: retentionKey)
-        refresh()
     }
 
     public func setRetentionDays(_ days: Int) {
@@ -280,18 +302,34 @@ public final class RuntimeSettingsModel: ObservableObject {
     }
 
     public func refresh() {
-        modelInstalled = !SpeechModelManager.installedModelFolders(
-            modelsRootURL: modelsRootURL
-        ).isEmpty
-        modelSize = directorySize(modelsRootURL)
-        storageSize = directorySize(applicationSupportURL)
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        let applicationSupportURL = applicationSupportURL
+        let modelsRootURL = modelsRootURL
+        Task { [weak self] in
+            let statistics = await Task.detached(priority: .utility) {
+                let installed = !SpeechModelManager.installedModelFolders(
+                    modelsRootURL: modelsRootURL
+                ).isEmpty
+                return (
+                    installed: installed,
+                    modelSize: Self.directorySize(modelsRootURL),
+                    storageSize: Self.directorySize(applicationSupportURL)
+                )
+            }.value
+            guard let self else { return }
+            self.modelInstalled = statistics.installed
+            self.modelSize = statistics.modelSize
+            self.storageSize = statistics.storageSize
+            self.isRefreshing = false
+        }
     }
 
     public func revealDataFolder() {
         NSWorkspace.shared.activateFileViewerSelecting([applicationSupportURL])
     }
 
-    private func directorySize(_ url: URL) -> Int64 {
+    nonisolated private static func directorySize(_ url: URL) -> Int64 {
         guard let enumerator = FileManager.default.enumerator(
             at: url,
             includingPropertiesForKeys: [.fileSizeKey],

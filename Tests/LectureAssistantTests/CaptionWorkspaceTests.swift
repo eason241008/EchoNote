@@ -132,4 +132,22 @@ final class CaptionWorkspaceTests: XCTestCase {
         XCTAssertEqual(settings.textSize, 38)
         XCTAssertEqual(settings.positionX, 21)
     }
+
+    func testCaptionScrollFollowsOnlyWhileReaderRemainsAtBottom() {
+        var state = CaptionScrollFollowState()
+        XCTAssertTrue(state.followsLatest)
+
+        // Content can grow before the programmatic scroll runs; that layout
+        // change alone must not be mistaken for a user scrolling upward.
+        state.updateGeometry(isAtBottom: false)
+        XCTAssertTrue(state.followsLatest)
+
+        state.updateScrollPhase(isIdle: false)
+        state.updateScrollPhase(isIdle: true)
+        XCTAssertFalse(state.followsLatest)
+
+        state.updateGeometry(isAtBottom: true)
+        state.updateScrollPhase(isIdle: true)
+        XCTAssertTrue(state.followsLatest)
+    }
 }

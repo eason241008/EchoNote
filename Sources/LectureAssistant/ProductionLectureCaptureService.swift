@@ -15,11 +15,13 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
 
     private var capture: AVFoundationLectureCaptureService?
     private var transcription: LiveTranscriptionPipeline?
+    private var transcriptionPipelines: [SessionID: LiveTranscriptionPipeline] = [:]
     private var translation: TranslationPipeline?
     private var frameTask: Task<Void, Never>?
     private var segmentTask: Task<Void, Never>?
     private var translationStateTask: Task<Void, Never>?
     private var translationResultTask: Task<Void, Never>?
+    private var retiredPipelineTasks: [Task<Void, Never>] = []
     private var postClassTask: Task<Void, Never>?
     private var postClassTaskToken: UUID?
     private var pendingPostClassJobs: [PostClassJob] = []
@@ -78,78 +80,39 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         captionWorkspace.updateCaptureState("准备录音")
         captionWorkspace.updateTranscriptionState("正在加载本地模型")
         let recognizer = try await loadRecognizer()
-        let transcriptRepository = SQLiteTranscriptRevisionRepository(database: database)
-        let transcription = LiveTranscriptionPipeline(
-            sessionID: preparation.session.id,
-            recognizer: recognizer,
-            repository: transcriptRepository,
-            finalWindowSeconds: 10,
-            partialWindowSeconds: 4
+        let (transcription, translation) = await makePipelines(
+            session: preparation.session,
+            recognizer: recognizer
         )
-        await transcription.updatePrompt(preparation.session.title)
-        let translation = makeTranslationPipeline()
         let capture = AVFoundationLectureCaptureService(storage: storage)
         try await capture.prepare(preparation)
 
         self.capture = capture
         self.transcription = transcription
+        transcriptionPipelines = [preparation.session.id: transcription]
         self.translation = translation
         captionWorkspace.setTranslationAvailable(true)
         captionWorkspace.updateTranscriptionState("本地模型已就绪")
         captionWorkspace.updateTranslationState("Apple 本地翻译")
 
-        frameTask = Task { [capture, transcription] in
+        frameTask = Task { [weak self, capture] in
             for await frame in capture.frames {
                 guard !Task.isCancelled else { break }
-                await transcription.consume(frame)
+                await self?.consume(frame)
             }
         }
-        segmentTask = Task { [weak self, transcription] in
-            for await segment in transcription.segments {
-                guard !Task.isCancelled else { break }
-                await MainActor.run {
-                    self?.captionWorkspace.append(segment)
-                    self?.captionWorkspace.updateTranscriptionState(
-                        segment.isGap ? "发现缺失片段" : "正在转写"
-                    )
-                }
-                if segment.isFinal, !segment.isGap, let revisionID = segment.revisionID {
-                    await self?.translation?.enqueue(PendingTranslationRevision(
-                        sessionID: segment.sessionID,
-                        revisionID: revisionID,
-                        text: segment.text
-                    ))
-                }
-            }
-        }
-        translationStateTask = Task { [weak self, translation] in
-            for await state in translation.states {
-                guard !Task.isCancelled else { break }
-                await MainActor.run { self?.updateTranslationState(state) }
-            }
-        }
-        translationResultTask = Task { [weak self, translation] in
-            for await result in translation.results {
-                guard !Task.isCancelled else { break }
-                await MainActor.run {
-                    self?.captionWorkspace.setTranslation(
-                        result.text,
-                        for: result.revisionID
-                    )
-                }
-            }
-        }
+        startObservers(
+            for: preparation.session,
+            transcription: transcription,
+            translation: translation
+        )
     }
 
     public func start() async throws {
         guard let capture else { throw AVFoundationCaptureError.notPrepared }
         try await capture.start()
         captionWorkspace.updateCaptureState("正在录音")
-        if var session = currentPreparation?.session {
-            session.state = .recording
-            session.updatedAt = LectureTimestamp()
-            try SQLiteLectureSessionRepository(database: database).save(session)
-        }
+        try updateCurrentSessionState(.recording)
     }
 
     public func prewarmRecognizer() async throws {
@@ -159,21 +122,80 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
     public func pause() async throws {
         try await capture?.pause()
         captionWorkspace.updateCaptureState("已暂停")
-        if var session = currentPreparation?.session {
-            session.state = .paused
-            session.updatedAt = LectureTimestamp()
-            try SQLiteLectureSessionRepository(database: database).save(session)
-        }
+        try updateCurrentSessionState(.paused)
     }
 
     public func resume() async throws {
         try await capture?.resume()
         captionWorkspace.updateCaptureState("正在录音")
-        if var session = currentPreparation?.session {
-            session.state = .recording
-            session.updatedAt = LectureTimestamp()
-            try SQLiteLectureSessionRepository(database: database).save(session)
+        try updateCurrentSessionState(.recording)
+    }
+
+    public func rollover(to session: LectureSession) async throws {
+        guard let capture, let currentPreparation else {
+            throw AVFoundationCaptureError.notPrepared
         }
+        let currentState = currentPreparation.session.state
+        let recognizer = try await loadRecognizer()
+        var nextSession = session
+        nextSession.state = currentState
+        nextSession.updatedAt = LectureTimestamp()
+        let nextPreparation = LectureCapturePreparation(
+            session: nextSession,
+            deviceID: currentPreparation.deviceID
+        )
+
+        try SQLiteLectureSessionRepository(database: database).save(nextSession)
+        try await storage.createSession(manifest: SessionManifest(
+            sessionID: nextSession.id,
+            state: nextSession.state,
+            selectedDeviceID: String(currentPreparation.deviceID),
+            courseID: nextSession.courseID,
+            transcriptionModel: SpeechModelDescriptor.largeV3Compressed.id
+        ))
+        let (nextTranscription, nextTranslation) = await makePipelines(
+            session: nextSession,
+            recognizer: recognizer
+        )
+        let previousSession = currentPreparation.session
+        let previousTranscription = transcription
+        let previousTranslation = translation
+        let previousSegmentTask = segmentTask
+        let previousTranslationStateTask = translationStateTask
+        let previousTranslationResultTask = translationResultTask
+
+        transcriptionPipelines[nextSession.id] = nextTranscription
+        do {
+            try await capture.rollover(to: nextPreparation)
+        } catch {
+            transcriptionPipelines[nextSession.id] = nil
+            throw error
+        }
+        transcription = nextTranscription
+        translation = nextTranslation
+        startObservers(
+            for: nextSession,
+            transcription: nextTranscription,
+            translation: nextTranslation
+        )
+        self.currentPreparation = nextPreparation
+        try markSessionCompleted(previousSession)
+        switch currentState {
+        case .paused:
+            captionWorkspace.updateCaptureState("已暂停")
+        default:
+            captionWorkspace.updateCaptureState("正在录音")
+        }
+        captionWorkspace.updateTranscriptionState("本地模型已就绪")
+        captionWorkspace.updateTranslationState("Apple 本地翻译")
+        retirePipeline(
+            session: previousSession,
+            transcription: previousTranscription,
+            translation: previousTranslation,
+            segmentTask: previousSegmentTask,
+            translationStateTask: previousTranslationStateTask,
+            translationResultTask: previousTranslationResultTask
+        )
     }
 
     public func stop() async throws {
@@ -185,6 +207,10 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         await translation?.finish()
         _ = await translationStateTask?.result
         _ = await translationResultTask?.result
+        while let retiredTask = retiredPipelineTasks.first {
+            retiredPipelineTasks.removeFirst()
+            _ = await retiredTask.result
+        }
         captionWorkspace.updateCaptureState("已完成")
         if capture.droppedFrameCount > 0 {
             captionWorkspace.updateTranscriptionState(
@@ -193,10 +219,8 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         } else {
             captionWorkspace.updateTranscriptionState("转写完成 · 音频零丢帧")
         }
-        if var session = currentPreparation?.session {
-            session.state = .completed
-            session.updatedAt = LectureTimestamp()
-            try SQLiteLectureSessionRepository(database: database).save(session)
+        if let session = currentPreparation?.session {
+            try markSessionCompleted(session)
         }
         postClassPausedForRecording = false
         enqueuePostClassTranscription()
@@ -208,6 +232,21 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
             repository: SQLiteTranslationRepository(database: database),
             batchingDelay: .milliseconds(80)
         )
+    }
+
+    private func makePipelines(
+        session: LectureSession,
+        recognizer: WhisperKitSpeechRecognizer
+    ) async -> (LiveTranscriptionPipeline, TranslationPipeline) {
+        let transcription = LiveTranscriptionPipeline(
+            sessionID: session.id,
+            recognizer: recognizer,
+            repository: SQLiteTranscriptRevisionRepository(database: database),
+            finalWindowSeconds: 10,
+            partialWindowSeconds: 4
+        )
+        await transcription.updatePrompt(session.title)
+        return (transcription, makeTranslationPipeline())
     }
 
     private func loadRecognizer() async throws -> WhisperKitSpeechRecognizer {
@@ -241,6 +280,10 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
 
     private func enqueuePostClassTranscription() {
         guard let session = currentPreparation?.session else { return }
+        enqueuePostClassTranscription(for: session)
+    }
+
+    private func enqueuePostClassTranscription(for session: LectureSession) {
         let job = PostClassJob(sessionID: session.id, title: session.title)
         if !pendingPostClassJobs.contains(job) {
             pendingPostClassJobs.append(job)
@@ -323,14 +366,119 @@ public final class ProductionLectureCaptureService: LectureCaptureService, @unch
         }
     }
 
+    private func startObservers(
+        for session: LectureSession,
+        transcription: LiveTranscriptionPipeline,
+        translation: TranslationPipeline
+    ) {
+        segmentTask = Task { [weak self, transcription, translation] in
+            for await segment in transcription.segments {
+                guard !Task.isCancelled else { break }
+                let visibleSegment = LiveTranscriptSegment(
+                    id: "\(session.id.rawValue.uuidString)-\(segment.id)",
+                    sessionID: segment.sessionID,
+                    start: segment.start,
+                    end: segment.end,
+                    text: segment.text,
+                    isFinal: segment.isFinal,
+                    isGap: segment.isGap,
+                    revisionID: segment.revisionID
+                )
+                await MainActor.run {
+                    self?.captionWorkspace.append(visibleSegment)
+                    self?.captionWorkspace.updateTranscriptionState(
+                        segment.isGap ? "发现缺失片段" : "正在转写"
+                    )
+                }
+                if segment.isFinal, !segment.isGap, let revisionID = segment.revisionID {
+                    await translation.enqueue(PendingTranslationRevision(
+                        sessionID: segment.sessionID,
+                        revisionID: revisionID,
+                        text: segment.text
+                    ))
+                }
+            }
+        }
+        translationStateTask = Task { [weak self, translation] in
+            for await state in translation.states {
+                guard !Task.isCancelled else { break }
+                await MainActor.run { self?.updateTranslationState(state) }
+            }
+        }
+        translationResultTask = Task { [weak self, translation] in
+            for await result in translation.results {
+                guard !Task.isCancelled else { break }
+                await MainActor.run {
+                    self?.captionWorkspace.setTranslation(
+                        result.text,
+                        for: result.revisionID
+                    )
+                }
+            }
+        }
+    }
+
+    private func consume(_ frame: CapturedAudioFrame) async {
+        if let sessionID = frame.sessionID,
+           let pipeline = transcriptionPipelines[sessionID] {
+            await pipeline.consume(frame)
+        } else {
+            await transcription?.consume(frame)
+        }
+    }
+
+    private func retirePipeline(
+        session: LectureSession,
+        transcription: LiveTranscriptionPipeline?,
+        translation: TranslationPipeline?,
+        segmentTask: Task<Void, Never>?,
+        translationStateTask: Task<Void, Never>?,
+        translationResultTask: Task<Void, Never>?
+    ) {
+        let task = Task { [weak self] in
+            await transcription?.finish()
+            _ = await segmentTask?.result
+            await translation?.finish()
+            _ = await translationStateTask?.result
+            _ = await translationResultTask?.result
+            await MainActor.run {
+                self?.enqueuePostClassTranscription(for: session)
+                self?.transcriptionPipelines[session.id] = nil
+            }
+        }
+        retiredPipelineTasks.append(task)
+    }
+
+    private func updateCurrentSessionState(_ state: SessionState) throws {
+        guard let existingPreparation = currentPreparation else { return }
+        var session = existingPreparation.session
+        session.state = state
+        session.updatedAt = LectureTimestamp()
+        currentPreparation = LectureCapturePreparation(
+            session: session,
+            deviceID: existingPreparation.deviceID
+        )
+        try SQLiteLectureSessionRepository(database: database).save(session)
+    }
+
+    private func markSessionCompleted(_ session: LectureSession) throws {
+        var completed = session
+        completed.state = .completed
+        completed.updatedAt = LectureTimestamp()
+        try SQLiteLectureSessionRepository(database: database).save(completed)
+    }
+
     private func cancelTasks() {
         frameTask?.cancel()
         segmentTask?.cancel()
         translationStateTask?.cancel()
         translationResultTask?.cancel()
+        retiredPipelineTasks.forEach { $0.cancel() }
         frameTask = nil
         segmentTask = nil
         translationStateTask = nil
         translationResultTask = nil
+        retiredPipelineTasks.removeAll(keepingCapacity: false)
+        transcriptionPipelines.removeAll(keepingCapacity: false)
     }
 }

@@ -17,6 +17,7 @@ public struct LectureCapturePreparation: Sendable {
 public protocol LectureCaptureService: Sendable {
     func prepare(_ preparation: LectureCapturePreparation) async throws
     func start() async throws
+    func rollover(to session: LectureSession) async throws
     func pause() async throws
     func resume() async throws
     func stop() async throws
@@ -68,6 +69,7 @@ public struct UnavailableLectureCaptureService: LectureCaptureService {
     public init() {}
     public func prepare(_ preparation: LectureCapturePreparation) async throws {}
     public func start() async throws {}
+    public func rollover(to session: LectureSession) async throws {}
     public func pause() async throws {}
     public func resume() async throws {}
     public func stop() async throws {}

@@ -14,6 +14,8 @@ final class RealSpeechModelTests: XCTestCase {
         let manager = SpeechModelManager(modelsRootURL: rootURL)
 
         try await manager.downloadAfterUserConfirmation()
+        let folder = try XCTUnwrap(manager.loadableModelFolder)
+        manager.markRecognizerReady(modelFolder: folder)
         XCTAssertTrue(manager.isReady)
         if case let .ready(folder) = manager.state {
             XCTAssertTrue(FileManager.default.fileExists(atPath: folder.path))

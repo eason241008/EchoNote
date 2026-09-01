@@ -12,6 +12,19 @@ public enum CaptionPresentationMode: String, CaseIterable, Codable, Sendable {
     case dynamicIsland
 }
 
+struct CaptionScrollFollowState: Equatable {
+    private(set) var isAtBottom = true
+    private(set) var followsLatest = true
+
+    mutating func updateGeometry(isAtBottom: Bool) {
+        self.isAtBottom = isAtBottom
+    }
+
+    mutating func updateScrollPhase(isIdle: Bool) {
+        followsLatest = isIdle ? isAtBottom : false
+    }
+}
+
 public struct CaptionDisplaySettings: Codable, Equatable, Sendable {
     public var languageVisibility: CaptionLanguageVisibility = .bilingual
     public var presentationMode: CaptionPresentationMode = .floatingWindow
@@ -185,7 +198,7 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
             )
             panel.level = .floating
             panel.hidesOnDeactivate = false
-            panel.isMovableByWindowBackground = true
+            panel.isMovableByWindowBackground = false
             panel.titleVisibility = .hidden
             panel.titlebarAppearsTransparent = true
             panel.standardWindowButton(.closeButton)?.isHidden = true
@@ -216,7 +229,7 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
         panel.styleMask = model.settings.presentationMode == .dynamicIsland
             ? [.borderless, .nonactivatingPanel]
             : [.titled, .nonactivatingPanel, .resizable]
-        panel.isMovableByWindowBackground = model.settings.presentationMode == .floatingWindow
+        panel.isMovableByWindowBackground = false
         panel.setContentSize(target.size)
         panel.setFrameOrigin(target.origin)
         let fixedFrameSize = panel.frameRect(
@@ -347,18 +360,23 @@ private struct CaptionOverlayView: View {
                 Spacer()
                 Button(action: hide) {
                     Image(systemName: "minus")
-                        .frame(width: 24, height: 20)
+                        .frame(width: 34, height: 28)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("隐藏字幕浮窗")
+                .help("隐藏字幕浮窗")
                 Button(action: close) {
                     Image(systemName: "xmark")
-                        .frame(width: 24, height: 20)
+                        .frame(width: 34, height: 28)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("关闭字幕浮窗")
+                .help("关闭字幕浮窗")
             }
             .fixedSize(horizontal: false, vertical: true)
+            .zIndex(1)
             ScrollViewReader { proxy in
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 14) {

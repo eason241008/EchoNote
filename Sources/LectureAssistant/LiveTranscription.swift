@@ -109,6 +109,7 @@ public actor LiveTranscriptionPipeline {
     private var isFinishing = false
     private var prompt: String?
     private var lastCapturedAt: ContinuousClock.Instant?
+    private let audioConverter = ReusableAudioFrameConverter()
     private let latencyTracker: CaptionLatencyTracker
     private let latencyStream: BoundedAsyncStream<CaptionLatencyStatus>
     private let outputStream: BoundedAsyncStream<LiveTranscriptSegment>
@@ -159,7 +160,7 @@ public actor LiveTranscriptionPipeline {
         guard !isFinishing else { return }
         lastCapturedAt = frame.capturedAt
         do {
-            pendingSamples.append(contentsOf: try frame.buffer.samples16kMono())
+            pendingSamples.append(contentsOf: try audioConverter.samples16kMono(from: frame.buffer))
         } catch {
             await emitGap(sampleCount: Int(frame.buffer.frameLength), reason: "Audio conversion failed")
             return
@@ -389,23 +390,50 @@ public enum AudioConversionError: Error {
     case conversionFailed
 }
 
-extension AVAudioPCMBuffer {
-    func samples16kMono() throws -> [Float] {
-        let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 16_000,
-            channels: 1,
-            interleaved: false
-        )!
-        if format.sampleRate == 16_000, format.channelCount == 1,
-           let channel = floatChannelData?[0] {
-            return Array(UnsafeBufferPointer(start: channel, count: Int(frameLength)))
+final class ReusableAudioFrameConverter {
+    private struct FormatSignature: Equatable {
+        let sampleRate: Double
+        let channelCount: AVAudioChannelCount
+        let commonFormat: AVAudioCommonFormat
+        let interleaved: Bool
+    }
+
+    private let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+    )!
+    private var sourceSignature: FormatSignature?
+    private var converter: AVAudioConverter?
+    private(set) var converterCreationCount = 0
+
+    func samples16kMono(from buffer: AVAudioPCMBuffer) throws -> [Float] {
+        if buffer.format.sampleRate == 16_000,
+           buffer.format.channelCount == 1,
+           let channel = buffer.floatChannelData?[0] {
+            return Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
         }
-        guard let converter = AVAudioConverter(from: format, to: targetFormat) else {
-            throw AudioConversionError.unsupportedFormat
+
+        let signature = FormatSignature(
+            sampleRate: buffer.format.sampleRate,
+            channelCount: buffer.format.channelCount,
+            commonFormat: buffer.format.commonFormat,
+            interleaved: buffer.format.isInterleaved
+        )
+        if converter == nil || sourceSignature != signature {
+            guard let newConverter = AVAudioConverter(from: buffer.format, to: targetFormat) else {
+                throw AudioConversionError.unsupportedFormat
+            }
+            converter = newConverter
+            sourceSignature = signature
+            converterCreationCount += 1
         }
-        let ratio = targetFormat.sampleRate / format.sampleRate
-        let capacity = AVAudioFrameCount(ceil(Double(frameLength) * ratio))
+        guard let converter else { throw AudioConversionError.unsupportedFormat }
+        converter.reset()
+
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio) + 32)
         guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
             throw AudioConversionError.unsupportedFormat
         }
@@ -418,11 +446,19 @@ extension AVAudioPCMBuffer {
             }
             supplied = true
             inputStatus.pointee = .haveData
-            return self
+            return buffer
         }
-        guard status != .error, conversionError == nil, let channel = output.floatChannelData?[0] else {
+        guard status != .error,
+              conversionError == nil,
+              let channel = output.floatChannelData?[0] else {
             throw AudioConversionError.conversionFailed
         }
         return Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
+    }
+}
+
+extension AVAudioPCMBuffer {
+    func samples16kMono() throws -> [Float] {
+        try ReusableAudioFrameConverter().samples16kMono(from: self)
     }
 }

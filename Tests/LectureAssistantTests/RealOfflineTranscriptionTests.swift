@@ -18,10 +18,10 @@ final class RealOfflineTranscriptionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: audioURL) }
         let modelManager = SpeechModelManager(modelsRootURL: rootURL.appendingPathComponent("models"))
         await modelManager.refresh()
-        if !modelManager.isReady {
+        if modelManager.loadableModelFolder == nil {
             try await modelManager.downloadAfterUserConfirmation()
         }
-        guard case let .ready(modelFolder) = modelManager.state else {
+        guard let modelFolder = modelManager.loadableModelFolder else {
             return XCTFail("Expected validated model")
         }
 
@@ -58,7 +58,7 @@ final class RealOfflineTranscriptionTests: XCTestCase {
         let manager = SpeechModelManager(modelsRootURL: URL(fileURLWithPath: modelsRootPath))
         await manager.refresh()
         let modelFolder = try XCTUnwrap(
-            manager.readyModelFolder,
+            manager.loadableModelFolder,
             "The local large-v3 model must already be installed and validated."
         )
         let samples = try loadMonoSamples16k(from: audioURL)
@@ -109,7 +109,7 @@ final class RealOfflineTranscriptionTests: XCTestCase {
             modelsRootURL: URL(fileURLWithPath: modelsRootPath)
         )
         await manager.refresh()
-        let modelFolder = try XCTUnwrap(manager.readyModelFolder)
+        let modelFolder = try XCTUnwrap(manager.loadableModelFolder)
         let samples = try loadMonoSamples16k(from: URL(fileURLWithPath: audioPath))
         let recognizer = try await WhisperKitSpeechRecognizer(modelFolder: modelFolder)
         let pipeline = LiveTranscriptionPipeline(

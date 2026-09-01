@@ -85,6 +85,48 @@ final class SchedulingTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testBackToBackEventsFormOneAutomaticCaptureChain() throws {
+        let first = ICSCourseEvent(
+            uid: "first",
+            summary: "COMP90016 Tutorial",
+            startsAt: Date(timeIntervalSince1970: 100),
+            endsAt: Date(timeIntervalSince1970: 200),
+            recurrenceID: nil,
+            courseCode: "COMP90016",
+            activity: "Tutorial"
+        )
+        let second = ICSCourseEvent(
+            uid: "second",
+            summary: "COMP90054 Lecture",
+            startsAt: Date(timeIntervalSince1970: 200),
+            endsAt: Date(timeIntervalSince1970: 300),
+            recurrenceID: nil,
+            courseCode: "COMP90054",
+            activity: "Lecture"
+        )
+        let later = ICSCourseEvent(
+            uid: "later",
+            summary: "COMP90015 Workshop",
+            startsAt: Date(timeIntervalSince1970: 700),
+            endsAt: Date(timeIntervalSince1970: 800),
+            recurrenceID: nil
+        )
+        let defaults = UserDefaults(suiteName: #function)!
+        defaults.removePersistentDomain(forName: #function)
+        let store = TimetableStore(
+            defaults: defaults,
+            initialEvents: [later, second, first]
+        )
+        let firstID = store.recordingEventIdentifier(for: first)
+
+        XCTAssertEqual(store.followingRecordingContext(after: firstID)?.event, second)
+        XCTAssertEqual(
+            store.automaticStopDeadline(after: firstID),
+            second.endsAt.addingTimeInterval(5 * 60)
+        )
+    }
+
     func testInvalidICSReportsUserSafeError() {
         XCTAssertThrowsError(try ICSParser().parse("not a calendar")) { error in
             XCTAssertEqual(error as? ICSParserError, .invalidCalendar)

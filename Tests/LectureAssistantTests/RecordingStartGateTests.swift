@@ -5,6 +5,7 @@ import XCTest
 private actor RecordingGateCaptureSpy: LectureCaptureService {
     private var preparedSessionIDs: [SessionID] = []
     private var startCount = 0
+    private var rolledSessionIDs: [SessionID] = []
     private var pauseCount = 0
     private var stopCount = 0
 
@@ -16,6 +17,10 @@ private actor RecordingGateCaptureSpy: LectureCaptureService {
         startCount += 1
     }
 
+    func rollover(to session: LectureSession) async throws {
+        rolledSessionIDs.append(session.id)
+    }
+
     func pause() async throws { pauseCount += 1 }
     func resume() async throws {}
     func stop() async throws { stopCount += 1 }
@@ -23,10 +28,11 @@ private actor RecordingGateCaptureSpy: LectureCaptureService {
     func invocations() -> (
         preparedSessionIDs: [SessionID],
         startCount: Int,
+        rolledSessionIDs: [SessionID],
         pauseCount: Int,
         stopCount: Int
     ) {
-        (preparedSessionIDs, startCount, pauseCount, stopCount)
+        (preparedSessionIDs, startCount, rolledSessionIDs, pauseCount, stopCount)
     }
 }
 
@@ -130,6 +136,72 @@ final class RecordingStartGateTests: XCTestCase {
         XCTAssertEqual(invocations.stopCount, 1)
         XCTAssertEqual(fixture.model.activeSession?.state, .completed)
         XCTAssertNil(fixture.model.automaticStopAt)
+    }
+
+    @MainActor
+    func testBackToBackClassesRolloverWithoutRestartingCapture() async throws {
+        let defaultsName = UUID().uuidString
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defaults.removePersistentDomain(forName: defaultsName)
+        let now = Date()
+        let first = ICSCourseEvent(
+            uid: "first",
+            summary: "COMP90016 Tutorial",
+            startsAt: now.addingTimeInterval(-1),
+            endsAt: now.addingTimeInterval(0.12),
+            recurrenceID: nil,
+            courseCode: "COMP90016",
+            activity: "Tutorial"
+        )
+        let second = ICSCourseEvent(
+            uid: "second",
+            summary: "COMP90054 Lecture",
+            startsAt: first.endsAt,
+            endsAt: now.addingTimeInterval(0.36),
+            recurrenceID: nil,
+            courseCode: "COMP90054",
+            activity: "Lecture"
+        )
+        let timetable = TimetableStore(
+            defaults: defaults,
+            initialEvents: [first, second]
+        )
+        let capture = RecordingGateCaptureSpy()
+        let services = ApplicationServices(
+            scheduling: EmptyCourseSchedulingService(),
+            capture: capture,
+            transcription: EmptyTranscriptionService(),
+            translation: EmptyTranslationService(),
+            studyNotes: EmptyStudyNotesService(),
+            library: EmptyLectureLibraryService(),
+            export: EmptyLectureExportService()
+        )
+        let model = ApplicationModel(
+            services: services,
+            defaults: defaults,
+            timetable: timetable,
+            automaticStopGracePeriod: 0.05
+        )
+        model.prepareSession(for: try XCTUnwrap(timetable.recordingContext(for: first)))
+        try model.acknowledgeRecordingPolicy()
+        model.updateCapturePreflight(readyPreflight())
+
+        try await model.startRecording()
+        try await Task.sleep(for: .milliseconds(220))
+
+        var invocations = await capture.invocations()
+        XCTAssertEqual(invocations.startCount, 1)
+        XCTAssertEqual(invocations.rolledSessionIDs.count, 1)
+        XCTAssertEqual(invocations.stopCount, 0)
+        XCTAssertEqual(model.activeSession?.title, timetable.recordingContext(for: second)?.title)
+        XCTAssertEqual(model.activeSession?.state, .recording)
+
+        try await Task.sleep(for: .milliseconds(300))
+        invocations = await capture.invocations()
+        XCTAssertEqual(invocations.startCount, 1)
+        XCTAssertEqual(invocations.rolledSessionIDs.count, 1)
+        XCTAssertEqual(invocations.stopCount, 1)
+        XCTAssertEqual(model.activeSession?.state, .completed)
     }
 
     @MainActor
