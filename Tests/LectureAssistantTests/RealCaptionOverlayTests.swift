@@ -39,6 +39,9 @@ final class RealCaptionOverlayTests: XCTestCase {
         XCTAssertTrue(controller.isVisible)
         XCTAssertEqual(controller.windowLevel, .floating)
         XCTAssertEqual(controller.windowSize, NSSize(width: 960, height: 390))
+        XCTAssertTrue(controller.hasDedicatedDragHandle)
+        XCTAssertGreaterThan(controller.dragHandleSize?.width ?? 0, 100)
+        XCTAssertGreaterThan(controller.dragHandleSize?.height ?? 0, 10)
         if let snapshotPath = ProcessInfo.processInfo.environment["LECTURE_ASSISTANT_OVERLAY_SNAPSHOT"] {
             let data = try XCTUnwrap(controller.snapshotPNG())
             try data.write(to: URL(fileURLWithPath: snapshotPath), options: .atomic)

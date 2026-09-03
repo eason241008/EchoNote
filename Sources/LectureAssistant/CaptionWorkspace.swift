@@ -179,6 +179,14 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
     }
     public var windowSize: NSSize? { window?.contentView?.bounds.size }
     public var presentationMode: CaptionPresentationMode { model.settings.presentationMode }
+    var hasDedicatedDragHandle: Bool {
+        guard let contentView = window?.contentView else { return false }
+        return firstDragHandle(in: contentView) != nil
+    }
+    var dragHandleSize: NSSize? {
+        guard let contentView = window?.contentView else { return nil }
+        return firstDragHandle(in: contentView)?.bounds.size
+    }
     var isContentScrolledToBottom: Bool? {
         guard let contentView = window?.contentView,
               let scrollView = firstScrollView(in: contentView),
@@ -324,6 +332,31 @@ public final class CaptionOverlayWindowController: NSObject, NSWindowDelegate {
         }
         return nil
     }
+
+    private func firstDragHandle(in view: NSView) -> CaptionWindowDragView? {
+        if let dragHandle = view as? CaptionWindowDragView { return dragHandle }
+        return view.subviews.lazy.compactMap { self.firstDragHandle(in: $0) }.first
+    }
+}
+
+private final class CaptionWindowDragView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
+private struct CaptionWindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> CaptionWindowDragView {
+        CaptionWindowDragView()
+    }
+
+    func updateNSView(_ nsView: CaptionWindowDragView, context: Context) {}
 }
 
 private struct CaptionOverlayView: View {
@@ -357,7 +390,13 @@ private struct CaptionOverlayView: View {
                 )
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-                Spacer()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay {
+                    if !isDynamicIsland {
+                        CaptionWindowDragHandle()
+                            .help("拖动字幕浮窗")
+                    }
+                }
                 Button(action: hide) {
                     Image(systemName: "minus")
                         .frame(width: 34, height: 28)
